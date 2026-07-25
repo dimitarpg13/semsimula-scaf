@@ -56,6 +56,22 @@ def test_fock_capabilities_expose_the_reverse_channel():
         assert "reverse_ch" in im.intervention_names
 
 
+def test_fock_adapter_declares_the_exchange_gate_too():
+    """``FockAttentionPARFLM`` gates a direct exchange force with
+    ``torch.tanh(exchange_scale)`` — structurally the same kind of
+    non-conservative channel as the reverse channel, and just as able to carry
+    a leak. If the adapter omits it, mediation reports a confident attribution
+    having never tested one of the two candidate carriers.
+    """
+    from tests.toy_models import TwoChannelLeakToyLM
+
+    with scaf.InterventableModel(TwoChannelLeakToyLM(CFG)) as im:
+        assert im.adapter.name == "fock"
+        assert "exchange_scale" in im.clampable_names
+        assert "reverse_channel_scale" in im.clampable_names
+        assert "exchange_scale" in im.mediators
+
+
 def test_unknown_intervention_name_raises():
     """Silently ignoring a knockout would make a leaky model look clean."""
     with scaf.InterventableModel(FockLikeToyLM(CFG)) as im:
@@ -82,21 +98,39 @@ def test_clamp_restores_the_original_value():
 def test_knocking_out_the_mediator_removes_the_leak():
     """Mediation in miniature: the gate is the leak's sole carrier.
 
-    Clamping it far negative drives the sigmoid to zero, which must restore
-    exact causality. This is the toy analogue of showing that the reverse
-    channel — not the registers themselves — is what carries the Fock leak.
+    ``knockout`` clamps the gate parameter to zero, and ``tanh(0) = 0`` closes
+    the channel — the same arithmetic as the real models. This is the toy
+    analogue of showing that the reverse channel, not the registers
+    themselves, is what carries the Fock leak.
     """
     corpus = SyntheticCorpus(CFG.vocab_size, seq_len=32)
     probe = scaf.FuturePerturbationProbe(n_seqs=4, micro_batch=0)
 
     with scaf.InterventableModel(FockLikeToyLM(CFG), dtype=torch.float64) as im:
-        with im.clamp(reverse_channel_scale=6.0):
-            leaking = probe.run(im, corpus)
-        with im.clamp(reverse_channel_scale=-60.0):
+        leaking = probe.run(im, corpus)
+        with im.knockout("reverse_channel_scale"):
             knocked_out = probe.run(im, corpus)
 
     assert leaking.statistic > 1e-6
-    assert knocked_out.statistic < 1e-12
+    assert knocked_out.statistic == 0.0
+
+
+def test_a_nonzero_gate_value_does_not_count_as_a_knockout():
+    """Guards the arithmetic that makes ``knockout`` meaningful.
+
+    ``tanh`` is odd, so driving the gate far *negative* flips the leak's sign
+    while leaving its magnitude at full strength. Only zero closes the channel.
+    A knockout implemented as "push the parameter to an extreme" would look
+    like it worked while the leak ran on untouched.
+    """
+    corpus = SyntheticCorpus(CFG.vocab_size, seq_len=32)
+    probe = scaf.FuturePerturbationProbe(n_seqs=4, micro_batch=0)
+
+    with scaf.InterventableModel(FockLikeToyLM(CFG), dtype=torch.float64) as im:
+        with im.clamp(reverse_channel_scale=-60.0):
+            still_leaking = probe.run(im, corpus)
+
+    assert still_leaking.statistic > 1e-6
 
 
 def test_hooks_are_removed_on_close():

@@ -16,6 +16,7 @@ from .controls import DeterminismControl, PlaceboControl, PositiveControl
 from .core.corpus import Corpus, SyntheticCorpus, TokenCorpus
 from .core.intervenable import InterventableModel
 from .probes.future_perturbation import FuturePerturbationProbe
+from .probes.mediation import MediationProbe
 from .probes.target_relocation import TargetRelocationProbe
 from .report import LeakScorecard
 
@@ -53,6 +54,7 @@ def audit(
     seed: int = 0,
     vocab_size: int | None = None,
     relocation_threshold: float = 1e-3,
+    mediation: bool = True,
 ) -> LeakScorecard:
     """Run the causal-leak audit battery and return a scorecard.
 
@@ -78,6 +80,9 @@ def audit(
         vocab_size: Needed only when no tokens are given and the adapter cannot
             read a vocabulary size from the model config.
         relocation_threshold: Tolerated honest-PPL gap in nats.
+        mediation: Attribute a detected leak to the component carrying it.
+            Costs one extra measurement per declared mediator, and runs only
+            when a leak was actually found, so it is free on a clean model.
 
     Returns:
         A :class:`~scaf.report.LeakScorecard`. Check ``.verdict`` or call
@@ -150,6 +155,18 @@ def audit(
             ).run(im, corpus),
         ]
 
+        # Attribution is only meaningful once detection has fired, and the
+        # probe would skip anyway on a clean model. Gating here keeps a clean
+        # audit from paying for a knockout sweep it cannot use.
+        diagnostics = []
+        leak_found = any(p.passed is False for p in probes)
+        if mediation and leak_found:
+            diagnostics.append(
+                MediationProbe(n_seqs=n_seqs, micro_batch=micro_batch).run(
+                    im, corpus
+                )
+            )
+
         return LeakScorecard(
             model=type(im.model).__name__,
             adapter=im.adapter.name,
@@ -157,6 +174,7 @@ def audit(
             device=str(im.device),
             controls=controls,
             probes=probes,
+            diagnostics=diagnostics,
             config=cfg,
             notes=tuple(notes),
         )

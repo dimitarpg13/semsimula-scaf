@@ -31,6 +31,11 @@ class LeakScorecard:
     device: str = ""
     controls: list[ProbeResult] = field(default_factory=list)
     probes: list[ProbeResult] = field(default_factory=list)
+    #: Attribution and other descriptive results. Reported but deliberately
+    #: excluded from the verdict: *where* a leak lives is a different question
+    #: from *whether* one exists, and good attribution must never make a leaky
+    #: model read as healthier.
+    diagnostics: list[ProbeResult] = field(default_factory=list)
     config: dict[str, Any] = field(default_factory=dict)
     notes: tuple[str, ...] = ()
 
@@ -68,7 +73,7 @@ class LeakScorecard:
         return self.verdict == "CLEAN"
 
     def get(self, name: str) -> ProbeResult | None:
-        for r in self.controls + self.probes:
+        for r in self.controls + self.probes + self.diagnostics:
             if r.name == name:
                 return r
         return None
@@ -108,6 +113,11 @@ class LeakScorecard:
                     "    (perplexities saturated; the nats gap is exact)"
                 )
 
+        if self.diagnostics:
+            lines += ["", "  Diagnostics (not part of the verdict):"]
+            lines += [f"    {d}" for d in self.diagnostics]
+            lines += self._attribution_lines()
+
         for n in self.notes:
             lines.append(f"  note: {n}")
 
@@ -118,6 +128,38 @@ class LeakScorecard:
                 "cannot certify anything)"
             )
         return "\n".join(lines)
+
+    def _attribution_lines(self) -> list[str]:
+        """Per-mediator attribution, strongest first."""
+        med = self.get("mediation")
+        if med is None or med.skipped:
+            return []
+        d = med.detail
+        out = [
+            f"    leak attribution (mean effect {d['total']:.4g}):"
+        ]
+        for name in d.get("ranking", []):
+            frac = d[f"attributed_{name}"]
+            out.append(
+                f"      {frac:7.1%} removed by knocking out {name}"
+                f"   (residual {d[f'cde_{name}']:.4g})"
+            )
+        if d.get("suppressors"):
+            out.append(
+                f"      note: {d['suppressors']} increased the leak when "
+                "removed — damping it, not carrying it"
+            )
+        if not d.get("knockout_verified", True):
+            out.append(
+                "      warning: no knockout reduced the leak — the clamp "
+                "reference is likely wrong for these components, which is "
+                "not evidence that they are innocent"
+            )
+        if d.get("not_intervenable"):
+            out.append(
+                f"      not intervenable: {d['not_intervenable']}"
+            )
+        return out
 
     def assert_causal(self) -> None:
         """Raise :class:`CausalLeakError` unless the verdict is ``CLEAN``."""
@@ -137,6 +179,7 @@ class LeakScorecard:
             "config": self.config,
             "controls": [c.to_dict() for c in self.controls],
             "probes": [p.to_dict() for p in self.probes],
+            "diagnostics": [d.to_dict() for d in self.diagnostics],
             "notes": list(self.notes),
         }
 

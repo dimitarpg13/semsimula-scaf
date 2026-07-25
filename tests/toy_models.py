@@ -33,6 +33,7 @@ __all__ = [
     "PureLookaheadToyLM",
     "DeafToyLM",
     "FockLikeToyLM",
+    "TwoChannelLeakToyLM",
 ]
 
 
@@ -156,24 +157,79 @@ class DeafToyLM(_ToyBase):
 class FockLikeToyLM(LeakyToyLM):
     """Carries Fock attribute names so :class:`~scaf.FockAdapter` detects it.
 
-    Used to test adapter resolution and mediator knockout without needing the
-    research repo on ``sys.path``.
+    The gate uses ``tanh``, matching the real models, which compute
+    ``scale = torch.tanh(reverse_channel_scale)``. That detail decides whether
+    knockout works at all: ``tanh(0) = 0`` closes the channel, so clamping the
+    parameter to zero is a valid knockout. Had the toy used ``sigmoid`` — where
+    zero maps to ``0.5`` — it would have "validated" a knockout that silently
+    left the leak half-open.
+
+    The gate is initialised open so the model leaks by default and is a
+    meaningful subject for :class:`~scaf.MediationProbe`.
     """
 
-    def __init__(self, cfg: ToyConfig | None = None, leak_scale: float = 1.0):
+    def __init__(
+        self,
+        cfg: ToyConfig | None = None,
+        leak_scale: float = 1.0,
+        gate_init: float = 1.0,
+    ):
         super().__init__(cfg, leak_scale=leak_scale)
         self.register_embed = nn.Parameter(torch.zeros(4, self.cfg.d))
         self.creation_gate = nn.Identity()
         self.reverse_ch = nn.Identity()
-        self.reverse_channel_scale = nn.Parameter(torch.zeros(1))
+        self.reverse_channel_scale = nn.Parameter(
+            torch.full((1,), float(gate_init))
+        )
 
     def forward(self, x):
         h = self.emb(x)
         global_pool = h.mean(dim=1, keepdim=True)
-        gate = torch.sigmoid(self.reverse_channel_scale).view(1, 1, 1)
-        # The leak is carried *only* through the gate, so clamping the gate to
-        # a large negative value must restore exact causality — which is what
-        # the mediation knockout test asserts.
+        gate = torch.tanh(self.reverse_channel_scale).view(1, 1, 1)
+        # The gate is the leak's sole carrier: closing it must restore exact
+        # causality, which is what the mediation knockout asserts.
         return self.out(
             self._prefix_mean(h) + self.leak_scale * gate * global_pool
         ), None
+
+
+class TwoChannelLeakToyLM(_ToyBase):
+    """Two independent leak carriers, for testing attribution arithmetic.
+
+    A single-mediator model cannot distinguish "this mediator explains the
+    leak" from "knocking out anything at all removes the leak". With two
+    carriers of deliberately unequal strength, the probe has to rank them and
+    report partial attribution, which is the case that actually exercises the
+    controlled-direct-effect logic.
+    """
+
+    def __init__(
+        self,
+        cfg: ToyConfig | None = None,
+        major: float = 1.0,
+        minor: float = 0.25,
+    ):
+        super().__init__(cfg)
+        self.reverse_channel_scale = nn.Parameter(torch.full((1,), major))
+        self.exchange_scale = nn.Parameter(torch.full((1,), minor))
+        self.register_embed = nn.Parameter(torch.zeros(4, self.cfg.d))
+        self.creation_gate = nn.Identity()
+
+    def forward(self, x):
+        h = self.emb(x)
+        # Both channels read the same global pool, one of them rotated in
+        # feature space. That keeps them equally *sensitive to a change in the
+        # future* while pointing in different directions, so the split between
+        # them is set by the gates alone.
+        #
+        # Earlier revisions used mean-pool against max-pool. Those are not
+        # comparably future-sensitive — a max barely moves when the suffix is
+        # resampled — so one channel carried ~98% of the effect regardless of
+        # its gate, and the toy could not exercise partial attribution at all.
+        pool = h.mean(dim=1, keepdim=True)
+        leak = (
+            torch.tanh(self.reverse_channel_scale).view(1, 1, 1) * pool
+            + torch.tanh(self.exchange_scale).view(1, 1, 1)
+            * torch.roll(pool, shifts=1, dims=-1)
+        )
+        return self.out(self._prefix_mean(h) + leak), None

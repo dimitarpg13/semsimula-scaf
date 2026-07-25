@@ -30,7 +30,12 @@ import torch
 
 from .base import Probe, ProbeResult
 
-__all__ = ["FuturePerturbationProbe"]
+__all__ = [
+    "FuturePerturbationProbe",
+    "PerturbationPairs",
+    "make_perturbation_pairs",
+    "measure_future_influence",
+]
 
 
 def _chunked_logits(im, x: torch.Tensor, micro_batch: int) -> torch.Tensor:
@@ -53,6 +58,63 @@ def _chunked_logits(im, x: torch.Tensor, micro_batch: int) -> torch.Tensor:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return torch.cat(outs, dim=0)
+
+
+#: ``(factual_tokens, [(split_fraction, t_p, counterfactual_tokens), ...])``.
+PerturbationPairs = tuple[torch.Tensor, list[tuple[float, int, torch.Tensor]]]
+
+
+def make_perturbation_pairs(
+    corpus,
+    n_seqs: int,
+    splits: tuple[float, ...],
+    n_pairs: int,
+    device=None,
+) -> PerturbationPairs:
+    """Draw the factual batch and its counterfactual futures once.
+
+    Materialising the interventions up front lets several measurements reuse
+    *identical* counterfactuals. That is essential for mediation: a controlled
+    direct effect is only comparable to the total effect if both were computed
+    against the same perturbed futures. Redrawing between arms would fold RNG
+    variation into the attribution and could manufacture, or hide, a mediator.
+    """
+    x = corpus.sample(n_seqs)
+    if device is not None:
+        x = x.to(device)
+    T = x.shape[1]
+    pairs: list[tuple[float, int, torch.Tensor]] = []
+    for frac in splits:
+        t_p = max(0, min(T - 2, int(round(frac * (T - 1)))))
+        for _ in range(n_pairs):
+            pairs.append((frac, t_p, corpus.perturb_suffix(x, t_p)))
+    return x, pairs
+
+
+def measure_future_influence(
+    im, x: torch.Tensor, pairs, micro_batch: int = 4
+) -> tuple[float, float, dict[str, float]]:
+    """Return ``(linf, aile, per_split_linf)`` for a prepared pair set.
+
+    Only positions ``<= t_p`` are compared: position ``t`` legitimately reads
+    ``x_0..x_t``, so everything after the cut is free to move.
+    """
+    base = _chunked_logits(im, x, micro_batch)
+    worst = 0.0
+    total_abs, total_n = 0.0, 0
+    per_split: dict[str, float] = {}
+
+    for frac, t_p, x_cf in pairs:
+        cf = _chunked_logits(im, x_cf, micro_batch)
+        delta = (base[:, : t_p + 1] - cf[:, : t_p + 1]).abs()
+        d_max = float(delta.max())
+        key = f"linf_at_{frac:g}"
+        per_split[key] = max(per_split.get(key, 0.0), d_max)
+        worst = max(worst, d_max)
+        total_abs += float(delta.sum())
+        total_n += delta.numel()
+
+    return worst, total_abs / max(total_n, 1), per_split
 
 
 class FuturePerturbationProbe(Probe):
@@ -92,42 +154,23 @@ class FuturePerturbationProbe(Probe):
         self.micro_batch = micro_batch
 
     def run(self, im, corpus) -> ProbeResult:
-        x = corpus.sample(self.n_seqs).to(im.device)
-        T = x.shape[1]
-
+        x, pairs = make_perturbation_pairs(
+            corpus, self.n_seqs, self.splits, self.n_pairs, im.device
+        )
         with im.deterministic():
-            base = _chunked_logits(im, x, self.micro_batch)
+            linf, aile, per_split = measure_future_influence(
+                im, x, pairs, self.micro_batch
+            )
 
-            worst_linf = 0.0
-            total_abs, total_n = 0.0, 0
-            per_split: dict[str, float] = {}
-
-            for frac in self.splits:
-                t_p = max(0, min(T - 2, int(round(frac * (T - 1)))))
-                split_linf = 0.0
-                for _ in range(self.n_pairs):
-                    x_cf = corpus.perturb_suffix(x, t_p)
-                    cf = _chunked_logits(im, x_cf, self.micro_batch)
-                    # Only positions <= t_p are constrained: position t reads
-                    # x_0..x_t, so everything after the cut is legitimately free
-                    # to move.
-                    delta = (base[:, : t_p + 1] - cf[:, : t_p + 1]).abs()
-                    split_linf = max(split_linf, float(delta.max()))
-                    total_abs += float(delta.sum())
-                    total_n += delta.numel()
-                per_split[f"linf_at_{frac:g}"] = split_linf
-                worst_linf = max(worst_linf, split_linf)
-
-        aile = total_abs / max(total_n, 1)
         return ProbeResult(
             name=self.name,
-            statistic=worst_linf,
+            statistic=linf,
             unit="logit",
             threshold=self.threshold,
-            passed=worst_linf <= self.threshold,
+            passed=linf <= self.threshold,
             detail={
                 "aile": aile,
-                "seq_len": T,
+                "seq_len": int(x.shape[1]),
                 "n_seqs": self.n_seqs,
                 "n_pairs": self.n_pairs,
                 **per_split,

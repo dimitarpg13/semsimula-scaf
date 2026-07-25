@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .base import Probe, ProbeResult
 from .future_perturbation import FuturePerturbationProbe
+from .mediation import MediationProbe
 from .target_relocation import TargetRelocationProbe
 
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "ProbeResult",
     "FuturePerturbationProbe",
     "TargetRelocationProbe",
+    "MediationProbe",
 ]

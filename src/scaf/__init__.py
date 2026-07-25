@@ -34,6 +34,7 @@ from .core.corpus import Corpus, SyntheticCorpus, TokenCorpus
 from .core.intervenable import InterventableModel
 from .probes.base import Probe, ProbeResult
 from .probes.future_perturbation import FuturePerturbationProbe
+from .probes.mediation import MediationProbe
 from .probes.target_relocation import TargetRelocationProbe
 from .report import CausalLeakError, LeakScorecard
 
@@ -60,6 +61,7 @@ __all__ = [
     "ProbeResult",
     "FuturePerturbationProbe",
     "TargetRelocationProbe",
+    "MediationProbe",
     # controls
     "DeterminismControl",
     "PlaceboControl",

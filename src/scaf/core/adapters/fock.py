@@ -35,6 +35,21 @@ _REVERSE_MARKERS = ("reverse_ch", "reverse_channel_scale")
 _CREATION_MARKERS = ("creation_gate", "creation_gate_qkv", "creation_gates")
 _DESTRUCTION_MARKERS = ("destruction_gates", "destruction_gate")
 
+#: ``FockAttentionPARFLM`` adds a direct exchange force behind its own
+#: ``torch.tanh(exchange_scale)`` gate — structurally the same kind of
+#: non-conservative channel as the reverse channel, and therefore just as
+#: capable of carrying a leak. It must be a first-class mediator: omitting it
+#: would let mediation report a confident attribution while never testing one
+#: of the two candidate carriers.
+_EXCHANGE_MARKERS = ("exchange_force", "exchange_scale")
+
+#: Learnable gates whose zero value closes the channel, because they are read
+#: through ``torch.tanh``. Clamping any of these to zero is a valid knockout.
+#: ``logit_scale`` is deliberately excluded: it is an output temperature, not a
+#: routing gate, and zeroing it would distort every logit rather than isolate
+#: a path.
+_CLAMPABLE_GATES = ("reverse_channel_scale", "exchange_scale")
+
 
 def _first_attr(model: nn.Module, names: Iterable[str]) -> str | None:
     for n in names:
@@ -66,11 +81,15 @@ class FockAdapter(ModelAdapter):
 
         mediators: list[str] = []
         if has_reverse:
-            # The reverse channel is the sole carrier of the known leak, so it
-            # is the first mediator we knock out.
-            mediators.append("reverse_channel_scale")
+            # The reverse channel carried the known leak, so it is knocked out
+            # first — but being first is a prior, not a conclusion.
+            if getattr(model, "reverse_channel_scale", None) is not None:
+                mediators.append("reverse_channel_scale")
             if getattr(model, "reverse_ch", None) is not None:
                 mediators.append("reverse_ch")
+        exchange = _first_attr(model, _EXCHANGE_MARKERS)
+        if exchange:
+            mediators.append(exchange)
         creation = _first_attr(model, _CREATION_MARKERS)
         if creation:
             mediators.append(creation)
@@ -141,9 +160,9 @@ class FockAdapter(ModelAdapter):
     ) -> Iterable[tuple[str, nn.Module]]:
         points: list[tuple[str, nn.Module]] = []
         for attr in (
-            "reverse_ch", "creation_gate", "creation_gate_qkv",
-            "creation_gates", "destruction_gates", "V_theta", "V_phi",
-            "xi_module", "score_head",
+            "reverse_ch", "exchange_force", "creation_gate",
+            "creation_gate_qkv", "creation_gates", "destruction_gates",
+            "V_theta", "V_phi", "xi_module", "score_head",
         ):
             mod = getattr(model, attr, None)
             if isinstance(mod, nn.Module):
@@ -154,9 +173,10 @@ class FockAdapter(ModelAdapter):
         self, model: nn.Module
     ) -> Iterable[tuple[str, nn.Parameter]]:
         params: list[tuple[str, nn.Parameter]] = []
-        scale = getattr(model, "reverse_channel_scale", None)
-        if isinstance(scale, (nn.Parameter, torch.Tensor)):
-            params.append(("reverse_channel_scale", scale))
+        for name in _CLAMPABLE_GATES:
+            gate = getattr(model, name, None)
+            if isinstance(gate, (nn.Parameter, torch.Tensor)):
+                params.append((name, gate))
         return params
 
     # ------------------------------------------------------------------

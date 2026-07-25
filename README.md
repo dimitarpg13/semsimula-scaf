@@ -49,6 +49,12 @@ SCAF audit — FockMultiXiPARFLM
 
     standard PPL 7.69  ->  honest PPL 258.07   (+3.510 nats, 33.4x inflation)
 
+  Diagnostics (not part of the verdict):
+    [PASS] mediation: 1 fraction (tol 0.9)
+    leak attribution (mean effect 0.0231):
+       100.0% removed by knocking out reverse_channel_scale   (residual 0)
+         0.0% removed by knocking out creation_gate_qkv   (residual 0.0231)
+
   VERDICT: LEAK
 ```
 
@@ -68,6 +74,22 @@ in nats. It answers *how much perplexity was unearned?*
 Both are needed. The register leak moved logits only slightly under far-future
 topic swaps while smuggling in an enormous next-token advantage, so the first
 probe alone understated it by orders of magnitude.
+
+Once a leak is found, `mediation` asks *where* it lives. It re-runs the same
+measurement with each candidate component clamped off — the controlled direct
+effect — and reports the fraction of the leak each knockout removes. If one
+component takes the residual to zero, that component is the locus.
+
+Two details make the number trustworthy. Every arm reuses the *same*
+counterfactual futures, so attribution cannot pick up RNG variation. And
+attribution is computed on the mean effect rather than the max: `linf` is right
+for detection because a causal model gives bit-exact zero there, but it is a max
+over positions, so two partially-cancelling channels can make removing the
+weaker one *raise* it and report a negative share.
+
+Mediation is a **diagnostic** and never affects the verdict. Where a leak lives
+is a different question from whether one exists, and good attribution must not
+make a leaky model read as healthier.
 
 ## Why the controls matter more than the probes
 
@@ -134,9 +156,9 @@ python tools/lint_markdown.py README.md docs/*.md   # GitHub KaTeX/Mermaid rules
 
 ## Status
 
-Alpha. The probe battery, controls, adapters, and scorecard are implemented and
-tested. Mediation attribution, the DoWhy/EconML estimand bridge, and the
-training-loop monitor are planned.
+Alpha. The probe battery (future perturbation, target relocation, mediation),
+the controls, the adapters, and the scorecard are implemented and tested. The
+DoWhy/EconML estimand bridge and the training-loop monitor are planned.
 
 ## License
 

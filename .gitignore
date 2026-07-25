@@ -1,26 +1,138 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
 .Python
+
+# Packaging / build
 build/
 dist/
+sdist/
+wheels/
 *.egg-info/
+*.egg
 .eggs/
+MANIFEST
+pip-wheel-metadata/
+.installed.cfg
 
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
 .venv/
 venv/
 env/
+ENV/
+.python-version
 
+# ---------------------------------------------------------------------------
+# Testing, coverage, linting, type checking
+# ---------------------------------------------------------------------------
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.tox/
+.nox/
+.hypothesis/
 .coverage
-htmlcov/
+.coverage.*
 coverage.xml
+htmlcov/
+nosetests.xml
 
-.DS_Store
+# ---------------------------------------------------------------------------
+# Notebooks
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ---------------------------------------------------------------------------
+# Node — only used by the Mermaid cross-check in tools/lint_markdown.py
+# ---------------------------------------------------------------------------
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# ---------------------------------------------------------------------------
+# Editors and IDEs
+# ---------------------------------------------------------------------------
 .idea/
 .vscode/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*~
+.\#*
+\#*\#
 
-# Audit artifacts
+# ---------------------------------------------------------------------------
+# OS cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------------
+# Temporary and scratch files
+# ---------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.log
+tmp/
+temp/
+scratch/
+.cache/
+
+# Anything a contributor marks local stays local.
+*.local
+*.local.*
+local/
+
+# ---------------------------------------------------------------------------
+# Secrets — never commit
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Model weights and token data
+#
+# SCAF audits checkpoints and reads .npy token dumps but should never carry
+# them: they are inputs to an audit, not part of the framework. Keeping them
+# out also stops a multi-GB checkpoint being committed by an errant `git add`.
+# ---------------------------------------------------------------------------
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npy
+*.npz
+checkpoints/
+wandb/
+lightning_logs/
+runs/
+
+# ---------------------------------------------------------------------------
+# SCAF audit artifacts
+# ---------------------------------------------------------------------------
 *.scorecard.json
 scaf_reports/
