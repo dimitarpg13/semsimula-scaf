@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+.venv/
+venv/
+env/
+
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+.DS_Store
+.idea/
+.vscode/
+
+# Audit artifacts
+*.scorecard.json
+scaf_reports/

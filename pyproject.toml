@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "semsimula-scaf"
+version = "0.1.0"
+description = "SCAF — a causal auditing framework that detects, sizes, and attributes causal leaks in SemSimula-family sequence models"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Dimitar P. Gueorguiev" }]
+keywords = [
+    "causal-inference",
+    "causal-auditing",
+    "language-models",
+    "interpretability",
+    "semsimula",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core stays deliberately light: the probe battery must install fast in Colab
+# and be cheap enough to run inside a training loop. Everything heavier is an
+# optional extra.
+#
+# NumPy is deliberately NOT a core dependency. SCAF is torch-native throughout,
+# which sidesteps the torch/NumPy major-version bridge — a combination that
+# breaks `torch.from_numpy` and `Tensor.numpy()` outright on several common
+# Colab and macOS wheel pairings. NumPy arrays are still accepted as input;
+# they are converted through the buffer protocol, which is unaffected.
+dependencies = [
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+# Formal estimand / refutation / CATE backends. Heavy dependency tree; only
+# needed for `scaf.estimate`, never for the core probe battery or the monitor.
+pywhy = [
+    "dowhy>=0.11",
+    "econml>=0.15",
+    "causal-learn>=0.1.3",
+    "pandas>=2.0",
+    "networkx>=3.0",
+]
+plot = [
+    "matplotlib>=3.7",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+]
+all = [
+    "semsimula-scaf[pywhy,plot,dev]",
+]
+
+[project.scripts]
+scaf = "scaf.cli:main"
+
+[project.urls]
+Repository = "https://github.com/dimitarpg13/semsimula-scaf"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scaf"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "semsimula: requires the semsimula-paper research repo on sys.path",
+    "slow: long-running probes",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
