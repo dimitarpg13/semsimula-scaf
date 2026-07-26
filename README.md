@@ -91,6 +91,119 @@ Mediation is a **diagnostic** and never affects the verdict. Where a leak lives
 is a different question from whether one exists, and good attribution must not
 make a leaky model read as healthier.
 
+## Monitoring a training run
+
+A one-off audit certifies a checkpoint, not a run. Leak channels are typically
+gated by a learnable scale initialised at zero, so the architecture leaks from
+step one while the measured effect is nil, and the valve opens gradually as the
+optimiser discovers the channel pays. By the time the final checkpoint is
+audited, every intermediate number in the log is already contaminated and
+nothing in the loss curve says when it happened.
+
+This is not hypothetical for the Fock models: `reverse_channel_scale` is
+initialised to exactly `0.0` behind a `tanh`, so at step zero the channel is
+shut and no probe can see it.
+
+```python
+monitor = scaf.LeakMonitor(
+    model, tokens=val_tokens, interval=20_000,
+    seq_len=512, micro_batch=2, jsonl_path=report_path,
+)
+for step in range(total_steps):
+    ...
+    monitor.maybe_run(step)          # returns a JSONL-ready dict, or None
+```
+
+```
+     step  verdict         linf        AILE   tau_leak
+        0  CLEAN      0.000e+00   0.000e+00     0.0000
+    20000  CLEAN      0.000e+00   0.000e+00     0.0000
+    40000  LEAK       2.069e-02   3.007e-03     0.4113
+  first leak detected at step 40000; every metric logged from that
+  point on was measured through it
+```
+
+Three properties make it safe to leave on. Global RNG state is saved and
+restored around every measurement, so a monitored run follows the *same*
+trajectory as an unmonitored one — without that, enabling monitoring would
+change which batches and dropout masks the model sees. Probe failures are
+caught and recorded as an `ERROR` verdict rather than killing the job. And the
+corpus is rewound before each run, so a change in AILE is a change in the model
+rather than in the draw.
+
+Scheduling is measured from the last run rather than by divisibility, so a run
+resumed at step 7000 probes on schedule instead of waiting for the next
+multiple.
+
+## Formal estimands: DoWhy, EconML, refutation
+
+The probe battery gives a verdict. `scaf.build_leak_frame` gives a **dataset**,
+so the same intervention can be handed to a causal-inference engine and
+interrogated with the standard verbs.
+
+```python
+frame = scaf.build_leak_frame(model, tokens=val_tokens, seq_len=512)
+print(frame.summary())                        # torch only, no extra deps
+print(scaf.estimate_leak(frame).summary())    # needs the [pywhy] extra
+```
+
+Each row is one scored target position under one arm — factual, or
+`do(future := resampled)` — with the negative log-likelihood of the true next
+token as the outcome, so the ATE is directly in nats and comparable to the
+honest-perplexity gap.
+
+**Identification is free, and the docs say so.** DoWhy's headline capability is
+deciding whether an effect is estimable despite confounding. SCAF gets nothing
+from it: the auditor assigns the arm, so no arrow points into the treatment and
+the paired difference is already the causal effect. What the stack is actually
+worth importing for is refutation, heterogeneity, and an independent estimator
+that has no freedom to disagree with the paired difference — a mismatch means
+the setup is wrong, and the report flags it.
+
+```
+SCAF estimand — do(future) on next-token NLL
+  ATE            +14.6692 nats
+  95% CI         [+9.60355, +20.2899]   (paired bootstrap)
+  p-value        9.999e-05   (sign-flip, exact under pairing)
+  paired ref.    +14.6692 nats   (agrees)
+
+  Refutations:
+    [PASS] placebo_treatment_refuter: new effect -1.078 (expected ~0)
+    [PASS] random_common_cause: new effect +14.66 (expected ~14.67)
+
+  Heterogeneity (exact stratified profile):
+    tau by distance_to_cut:   [CausalForestDML in brackets]
+      distance_to_cut=0            +107.6 nats  ( 36 pairs)   [+108.6]
+      distance_to_cut=1                +0 nats  ( 12 pairs)   [+0.6062]
+      distance_to_cut=2                +0 nats  ( 24 pairs)   [-0.1473]
+      ...
+      peak at distance_to_cut=0 (+107.6 nats)
+```
+
+`distance_to_cut` is the diagnostic axis. A next-token peek is a spike at zero
+and nothing else; a shared-register leak spikes at the cut and decays; a
+global-pool leak is roughly flat.
+
+Three choices here are deliberate and worth knowing about:
+
+- **Inference is paired, not pooled.** Leak effects are wildly
+  heteroscedastic — one position can carry a hundred nats while every other
+  carries exactly zero. DoWhy's own permutation test scrambles the treatment
+  label across the whole frame, discards the pairing, and returned `p = 0.69`
+  for an effect its own interval put at `[10.4, 18.5]`. That is a false
+  all-clear. SCAF reports an exact sign-flip permutation test over pair
+  differences instead, and keeps DoWhy's version behind `dowhy_inference=True`.
+- **The outcome is centred within each pair.** Raw NLL varies by nats across
+  positions for reasons having nothing to do with the treatment. Centring
+  removes about 90% of that spread on a realistic model while leaving the ATE
+  bit-identical.
+- **The CATE default is a causal forest, not `LinearDML`.** Fitted to a spiky
+  leak profile, the linear model reports a third of the true peak and a
+  spurious *negative* effect far from the cut — the future appearing to
+  suppress the past. The forest recovers the peak to within 1%. An exact
+  model-free stratified profile is reported either way; the fit is a smoother
+  over it, not a better measurement of it.
+
 ## Why the controls matter more than the probes
 
 A leak probe reporting zero means either the model is causal, or **the probe
@@ -154,11 +267,24 @@ ruff check .
 python tools/lint_markdown.py README.md docs/*.md   # GitHub KaTeX/Mermaid rules
 ```
 
+The suite runs without the `[pywhy]` extra; the DoWhy/EconML tests skip. To run
+them, install `".[dev,pywhy]"`.
+
+Integration tests against the real Fock-PARFLM models are marked `semsimula`
+and skip unless the research repo is present. Point `SEMSIMULA_PAPER` at it, or
+keep it as a sibling checkout. They assert the finding SCAF was built around:
+with the reverse-channel gate open, the legacy register implementation reports
+`LEAK` while `prefix_causal_registers=True` gives bit-exact zero.
+
 ## Status
 
-Alpha. The probe battery (future perturbation, target relocation, mediation),
-the controls, the adapters, and the scorecard are implemented and tested. The
-DoWhy/EconML estimand bridge and the training-loop monitor are planned.
+Alpha, feature-complete for the planned scope. Implemented and tested: the
+probe battery (future perturbation, target relocation, mediation), the
+controls, the adapters, the scorecard, the training-loop monitor, and the
+DoWhy/EconML estimand bridge with exact paired inference.
+
+Not yet built: empirical DAG discovery via `causal-learn`, and adapters beyond
+Fock and the generic fallback.
 
 ## License
 

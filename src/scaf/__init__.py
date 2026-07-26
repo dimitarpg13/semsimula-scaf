@@ -15,6 +15,20 @@ Quickstart::
     report = scaf.audit(model, tokens=val_tokens, device="cuda")
     print(report.summary())
     report.assert_causal()   # raises CausalLeakError on a leak
+
+Inside a training loop, to record *when* a leak opens rather than only that it
+did::
+
+    monitor = scaf.LeakMonitor(model, tokens=val_tokens, interval=20_000)
+    for step in range(total_steps):
+        ...
+        monitor.maybe_run(step)
+
+And to hand a measured leak to a formal causal-inference engine::
+
+    frame = scaf.build_leak_frame(model, tokens=val_tokens)
+    print(frame.summary())                       # torch only
+    print(scaf.estimate_leak(frame).summary())   # needs the [pywhy] extra
 """
 
 from __future__ import annotations
@@ -32,6 +46,9 @@ from .core.adapters import (
 )
 from .core.corpus import Corpus, SyntheticCorpus, TokenCorpus
 from .core.intervenable import InterventableModel
+from .estimate.frames import LeakFrame, build_leak_frame
+from .estimate.pywhy import EstimationReport, RefutationResult, estimate_leak
+from .monitor import LeakMonitor
 from .probes.base import Probe, ProbeResult
 from .probes.future_perturbation import FuturePerturbationProbe
 from .probes.mediation import MediationProbe
@@ -66,6 +83,14 @@ __all__ = [
     "DeterminismControl",
     "PlaceboControl",
     "PositiveControl",
+    # continuous monitoring
+    "LeakMonitor",
+    # formal estimands
+    "LeakFrame",
+    "build_leak_frame",
+    "estimate_leak",
+    "EstimationReport",
+    "RefutationResult",
     # reporting
     "LeakScorecard",
     "CausalLeakError",

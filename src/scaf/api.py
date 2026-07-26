@@ -14,29 +14,13 @@ from torch import nn
 
 from .controls import DeterminismControl, PlaceboControl, PositiveControl
 from .core.corpus import Corpus, SyntheticCorpus, TokenCorpus
-from .core.intervenable import InterventableModel
+from .core.intervenable import InterventableModel, resolve_dtype
 from .probes.future_perturbation import FuturePerturbationProbe
 from .probes.mediation import MediationProbe
 from .probes.target_relocation import TargetRelocationProbe
 from .report import LeakScorecard
 
 __all__ = ["audit"]
-
-_DTYPES = {
-    "float64": torch.float64, "f64": torch.float64, "double": torch.float64,
-    "float32": torch.float32, "f32": torch.float32, "float": torch.float32,
-}
-
-
-def _resolve_dtype(dtype):
-    if dtype is None or isinstance(dtype, torch.dtype):
-        return dtype
-    key = str(dtype).lower().replace("torch.", "")
-    if key not in _DTYPES:
-        raise ValueError(
-            f"unknown dtype {dtype!r}; use one of {sorted(_DTYPES)}"
-        )
-    return _DTYPES[key]
 
 
 def audit(
@@ -91,7 +75,7 @@ def audit(
     owns = not isinstance(model, InterventableModel)
     im = (
         InterventableModel(
-            model, adapter=adapter, device=device, dtype=_resolve_dtype(dtype)
+            model, adapter=adapter, device=device, dtype=resolve_dtype(dtype)
         )
         if owns
         else model

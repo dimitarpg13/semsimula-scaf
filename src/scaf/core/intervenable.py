@@ -28,9 +28,31 @@ from torch import nn
 
 from .adapters import ModelAdapter, resolve_adapter
 
-__all__ = ["InterventableModel"]
+__all__ = ["InterventableModel", "resolve_dtype"]
 
 TensorEdit = Callable[[torch.Tensor], torch.Tensor]
+
+_DTYPES = {
+    "float64": torch.float64, "f64": torch.float64, "double": torch.float64,
+    "float32": torch.float32, "f32": torch.float32, "float": torch.float32,
+}
+
+
+def resolve_dtype(dtype):
+    """Accept ``"float64"`` and friends wherever a ``torch.dtype`` is expected.
+
+    Resolution lives here, at the single point every entry path funnels
+    through, rather than in each public function. Duplicating it once produced
+    an API where ``audit(dtype="float64")`` worked and
+    ``build_leak_frame(dtype="float64")`` raised a ``TypeError`` from deep
+    inside ``Module.to``.
+    """
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return dtype
+    key = str(dtype).lower().replace("torch.", "")
+    if key not in _DTYPES:
+        raise ValueError(f"unknown dtype {dtype!r}; use one of {sorted(_DTYPES)}")
+    return _DTYPES[key]
 
 
 def zero_out(t: torch.Tensor) -> torch.Tensor:
@@ -66,6 +88,7 @@ class InterventableModel:
         self.device = torch.device(device)
         self.model = model
         self.caps = self.adapter.capabilities(model)
+        dtype = resolve_dtype(dtype)
 
         self._orig_dtype = next(
             (p.dtype for p in model.parameters()), torch.float32

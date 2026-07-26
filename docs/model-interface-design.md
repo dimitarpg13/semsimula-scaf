@@ -366,26 +366,112 @@ import scaf
 
 report = scaf.audit(
     model,                       # adapter auto-detected
-    corpus=val_tokens,           # np.ndarray of validation token ids
-    context=512,
+    tokens=val_tokens,           # validation token ids
+    seq_len=512,
     dtype="float64",             # bit-exact determinism baseline, axiom A6
 )
-print(report)
-report.to_json("audit_step103500.json")
-assert report.passed(), "causal leak detected"
+print(report.summary())
+report.assert_causal()           # raises CausalLeakError on a leak
 ```
 
-And inside a training loop, using the cheap proxy rather than the full battery:
+`dtype="float64"` is right for an architectural probe on a small model. On a
+real checkpoint use `"float32"`: doubling an already-large memory footprint
+buys nothing, because `DeterminismControl` measures the actual noise floor and
+raises the leak threshold to it.
+
+And inside a training loop, using a reduced battery on a fixed set of
+sequences:
 
 ```python
-monitor = scaf.LeakMonitor(model, corpus=val_tokens, interval=20_000)
+monitor = scaf.LeakMonitor(
+    model, tokens=val_tokens, interval=20_000,
+    seq_len=512, micro_batch=2, jsonl_path=report_path,
+)
 ...
-if (record := monitor.maybe_run(step)) is not None:
-    log_f.write(json.dumps(record) + "\n")
+monitor.maybe_run(step)          # writes the record itself when given a path
 ```
 
 Neither snippet mentions an adapter, a hook, or a model family. That is the
 point of the layer.
+
+### 7.1 What the monitor must not do
+
+The monitor runs against a model that is mid-training, which imposes
+constraints the one-off audit does not have. Three are load-bearing.
+
+**RNG state is saved and restored** around every measurement. The monitor draws
+probe sequences and the model's own forward may consume randomness through
+dropout or stochastic routing. Left unrestored, those draws shift every
+subsequent training batch and mask, so enabling monitoring would change the run
+it is supposed to observe — and two runs differing only in observability would
+diverge.
+
+**Hooks are installed per measurement, not held.** `InterventableModel`
+registers forward hooks; one left installed runs on every training step
+afterwards, which is both a cost and a path by which the auditor could perturb
+what it audits. The monitor constructs and closes the wrapper inside `run`.
+
+**Failures are recorded, not raised.** A diagnostic that kills a thousand-minute
+job over an out-of-memory error is worse than no diagnostic. Exceptions become
+an `ERROR` verdict in the record. Aborting on an actual leak is available via
+`raise_on_leak=True`, off by default.
+
+Scheduling is measured from the last run rather than by divisibility, because
+divisibility silently stops probing after a resume lands off the grid — which
+is exactly when the leak state matters most.
+
+---
+
+## 7A. From probe to estimand
+
+`scaf.build_leak_frame` re-runs the future-perturbation intervention and
+records it row by row, producing a tidy interventional dataset. It uses the
+same `make_perturbation_pairs` helper as the probe, so a frame built with
+matching arguments describes exactly the intervention the probe measured.
+
+| Column | Role |
+|---|---|
+| `future_perturbed` | binary treatment: factual, or `do(future := resampled)` |
+| `nll` | outcome — NLL of the true next token, so the ATE is in nats |
+| `nll_within` | the same, centred within each pair |
+| `unit_id` | pairs each counterfactual row with its factual reference |
+| `distance_to_cut` | positions from the split — the leak-shape diagnostic |
+| `target_perturbed` | true only where the scored target is itself resampled |
+
+The split between the last two matters. At `t = t_p` the target is the first
+resampled token, so that row asks "can the model see the very next token" —
+the sharpest form of the leak. Every other row asks "does the distant future
+move a prediction whose target did not change". Averaging a sharp effect into a
+diffuse one loses the distinction, so the frame keeps them separable.
+
+**Treatment is exogenous by construction.** The auditor assigns the arm, so the
+graph has no edge into the treatment, the backdoor set is empty, and
+identification is free. This is the structural difference between auditing a
+simulator and analysing observational data, and it means the naive paired
+difference *is* the ATE. `scaf.estimate_leak` reports DoWhy's estimate beside
+it and flags disagreement, treating a mismatch as a misconfigured estimator
+rather than a subtler finding.
+
+### 7A.1 Why the pairing is defended so carefully
+
+Leak effects are extremely heteroscedastic: one position can carry a hundred
+nats while every other position carries exactly zero. Two standard analyses
+break on that shape, and both break in the dangerous direction.
+
+DoWhy's permutation significance test scrambles the treatment label across the
+pooled frame. That destroys the pairing which carries the entire signal, and on
+the peeking reference model it returned `p = 0.69` for an effect whose own
+confidence interval was `[10.4, 18.5]`. A framework built to prevent false
+all-clears cannot ship that as its headline p-value, so `LeakFrame.ate_test`
+runs an exact sign-flip permutation over pair differences instead, and DoWhy's
+version is available behind `dowhy_inference=True`.
+
+`LinearDML` cannot represent a spike. Fitted to a profile that is 107 nats at
+distance zero and zero elsewhere, it reports roughly a third of the peak and a
+spurious *negative* effect far from the cut — which would read as the future
+suppressing the past. `CausalForestDML` recovers the peak to within 1% and runs
+faster, so it is the default. The exact stratified profile is reported either
+way; the fit is a smoother over it, not a better measurement of it.
 
 ---
 
