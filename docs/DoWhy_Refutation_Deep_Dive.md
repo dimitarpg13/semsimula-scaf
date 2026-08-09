@@ -146,7 +146,7 @@ Both are compared against the original effect through a single tolerance
 band, `refute_tol` (default `0.1`, i.e. 10%):
 
 $$
-\text{band} = \text{refute\_tol} \times \max\big(|\text{original effect}|, 10^{-9}\big).
+\text{band} = \text{refute-tol} \times \max\big(|\text{original effect}|, 10^{-9}\big)
 $$
 
 `placebo_treatment_refuter` passes when $|\text{new effect}| \le \text{band}$;

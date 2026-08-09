@@ -195,6 +195,19 @@ def check_katex(path: str, seg) -> list[Finding]:
                                  f"{n} '}}_x' patterns on one line pair as italic; "
                                  r"escape each as }\_x",
                                  line.strip()))
+            # 12a — \_ inside \text{..}/\mathrm{..}/etc. is math-mode-only
+            for m in maths:
+                if re.search(
+                    r"\\(?:text|mathrm|mathbf|textbf|textrm|mathsf|boldsymbol)"
+                    r"\{[^{}]*\\_[^{}]*\}",
+                    m,
+                ):
+                    f.append(Finding(path, ln, "§12a", FATAL,
+                                     r"\_ inside \text{..} errors with "
+                                     "\"'_' allowed only in math mode\"; use a "
+                                     "literal underscore or a hyphen/space",
+                                     line.strip()))
+                    break
             # 7 — display line starting with "- "
             if kind == "math" and line.strip().startswith("- "):
                 f.append(Finding(path, ln, "§7", FATAL,
@@ -365,6 +378,7 @@ RULES = {
     "§10": "\\tag{} in display math",
     "§11": "\\! negative thin space",
     "§12": "}_x subscripts, 2+ per line",
+    "§12a": "\\_ inside \\text{..} (math-mode-only command)",
     "§13": "literal < > inside math",
     "§14": "braces in Mermaid node labels",
     "§15": "nested brackets in Mermaid node labels",
