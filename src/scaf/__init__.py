@@ -51,6 +51,7 @@ from .estimate.pywhy import EstimationReport, RefutationResult, estimate_leak
 from .monitor import LeakMonitor
 from .probes.base import Probe, ProbeResult
 from .probes.future_perturbation import FuturePerturbationProbe
+from .probes.hidden_state import HiddenStateLeakProbe
 from .probes.mediation import MediationProbe
 from .probes.target_relocation import TargetRelocationProbe
 from .report import CausalLeakError, LeakScorecard
@@ -77,6 +78,7 @@ __all__ = [
     "Probe",
     "ProbeResult",
     "FuturePerturbationProbe",
+    "HiddenStateLeakProbe",
     "TargetRelocationProbe",
     "MediationProbe",
     # controls

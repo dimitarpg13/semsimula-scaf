@@ -62,6 +62,7 @@ from ..probes.future_perturbation import (
     _chunked_logits,
     make_perturbation_pairs,
 )
+from ..probes.hidden_state import _chunked_trajectory, _cosine_deviation
 
 __all__ = ["LeakFrame", "build_leak_frame"]
 
@@ -448,6 +449,7 @@ def build_leak_frame(
     micro_batch: int = 4,
     seed: int = 0,
     vocab_size: int | None = None,
+    include_hidden_states: bool = False,
 ) -> LeakFrame:
     """Run the future-perturbation intervention and record it row by row.
 
@@ -479,6 +481,13 @@ def build_leak_frame(
         seed: Corpus seed.
         vocab_size: Needed only for a synthetic corpus when the adapter cannot
             read a vocabulary size from the model config.
+        include_hidden_states: When ``True`` and the adapter exposes
+            ``has_hidden_states``, the frame gains ``hidden_cos_dev`` and
+            ``layer`` columns — one row per (layer, position) rather than per
+            position alone. ``layer`` is added to ``effect_modifiers`` so
+            CATE-by-layer analysis works out of the box. When ``False``
+            (default) or the adapter lacks trajectory support, the frame is
+            unchanged.
 
     Returns:
         A :class:`LeakFrame`.
@@ -510,31 +519,38 @@ def build_leak_frame(
         )
         T = int(x.shape[1])
 
-        cols: dict[str, list] = {
-            k: []
-            for k in (
-                "unit_id", "future_perturbed", "nll", "logit_l1",
-                "position", "position_frac", "distance_to_cut",
-                "split_frac", "target_perturbed", "seq_id", "pair_id",
-            )
-        }
+        use_hidden = (
+            include_hidden_states and im.caps.has_hidden_states
+        )
+
+        col_names = [
+            "unit_id", "future_perturbed", "nll", "logit_l1",
+            "position", "position_frac", "distance_to_cut",
+            "split_frac", "target_perturbed", "seq_id", "pair_id",
+        ]
+        if use_hidden:
+            col_names += ["hidden_cos_dev", "layer"]
+        cols: dict[str, list] = {k: [] for k in col_names}
         n_skipped_splits = 0
 
         with im.deterministic():
             base = _chunked_logits(im, x, micro_batch)
             x_cpu = x.to(base.device)
+            base_traj = None
+            if use_hidden:
+                _, base_traj = _chunked_trajectory(im, x, micro_batch)
 
             seen: dict[tuple[float, int], int] = {}
             for frac, t_p, x_cf in pairs:
                 pair_id = seen[(frac, t_p)] = seen.get((frac, t_p), -1) + 1
                 cf = _chunked_logits(im, x_cf, micro_batch)
+                cf_traj = None
+                if use_hidden:
+                    _, cf_traj = _chunked_trajectory(im, x_cf, micro_batch)
 
                 lo = max(1, int(round(first_frac * (T - 1))))
                 hi = t_p
                 if hi < lo:
-                    # The cut sits inside the warm-up region, so there is no
-                    # position with enough context to score. Skipping keeps a
-                    # context-starved NLL out of the average.
                     n_skipped_splits += 1
                     continue
                 n = min(max_positions, hi - lo + 1)
@@ -543,6 +559,25 @@ def build_leak_frame(
                         torch.linspace(lo, hi, steps=n)
                         .round().long().tolist()
                     )
+                )
+
+                # Pre-compute per-layer cosine deviation for all prefix
+                # positions in one pass (only the needed positions are
+                # indexed below).
+                cos_dev_by_layer: list[torch.Tensor] | None = None
+                if use_hidden and base_traj is not None and cf_traj is not None:
+                    cos_dev_by_layer = [
+                        _cosine_deviation(
+                            base_traj[ell][:, : t_p + 1],
+                            cf_traj[ell][:, : t_p + 1],
+                        )
+                        for ell in range(len(base_traj))
+                    ]
+
+                layers = (
+                    list(range(len(base_traj)))
+                    if use_hidden and base_traj is not None
+                    else [None]
                 )
 
                 for t in positions:
@@ -555,25 +590,45 @@ def build_leak_frame(
                     )
                     l1 = (cf[:, t] - base[:, t]).abs().sum(-1).float()
 
-                    for b in range(x.shape[0]):
-                        unit = f"s{b}_c{t_p}_p{pair_id}_t{t}"
-                        for arm, nll, dev in (
-                            (0, float(nll_f[b]), 0.0),
-                            (1, float(nll_c[b]), float(l1[b])),
-                        ):
-                            cols["unit_id"].append(unit)
-                            cols["future_perturbed"].append(arm)
-                            cols["nll"].append(nll)
-                            cols["logit_l1"].append(dev)
-                            cols["position"].append(int(t))
-                            cols["position_frac"].append(t / (T - 1))
-                            cols["distance_to_cut"].append(int(t_p - t))
-                            cols["split_frac"].append(float(frac))
-                            cols["target_perturbed"].append(
-                                int(t + 1 > t_p)
+                    for ell in layers:
+                        for b in range(x.shape[0]):
+                            layer_tag = (
+                                f"_L{ell}" if ell is not None else ""
                             )
-                            cols["seq_id"].append(int(b))
-                            cols["pair_id"].append(int(pair_id))
+                            unit = (
+                                f"s{b}_c{t_p}_p{pair_id}_t{t}{layer_tag}"
+                            )
+                            for arm, nll, dev in (
+                                (0, float(nll_f[b]), 0.0),
+                                (1, float(nll_c[b]), float(l1[b])),
+                            ):
+                                cols["unit_id"].append(unit)
+                                cols["future_perturbed"].append(arm)
+                                cols["nll"].append(nll)
+                                cols["logit_l1"].append(dev)
+                                cols["position"].append(int(t))
+                                cols["position_frac"].append(t / (T - 1))
+                                cols["distance_to_cut"].append(
+                                    int(t_p - t)
+                                )
+                                cols["split_frac"].append(float(frac))
+                                cols["target_perturbed"].append(
+                                    int(t + 1 > t_p)
+                                )
+                                cols["seq_id"].append(int(b))
+                                cols["pair_id"].append(int(pair_id))
+                                if use_hidden:
+                                    cos_val = (
+                                        float(cos_dev_by_layer[ell][b, t])
+                                        if arm == 1
+                                        and cos_dev_by_layer is not None
+                                        and t < cos_dev_by_layer[ell].shape[1]
+                                        else 0.0
+                                    )
+                                    cols["hidden_cos_dev"].append(cos_val)
+                                    cols["layer"].append(
+                                        ell if ell is not None else -1
+                                    )
 
         if not cols["unit_id"]:
             raise ValueError(
@@ -582,8 +637,16 @@ def build_leak_frame(
                 "warm-up region. Use a longer seq_len or later splits."
             )
 
+        modifiers = (
+            "position", "split_frac", "target_perturbed",
+            "distance_to_cut",
+        )
+        if use_hidden:
+            modifiers = modifiers + ("layer",)
+
         frame = LeakFrame(
             columns=cols,
+            effect_modifiers=modifiers,
             metadata={
                 "model": type(im.model).__name__,
                 "adapter": im.adapter.name,
@@ -595,6 +658,7 @@ def build_leak_frame(
                 "n_pairs": n_pairs,
                 "max_positions": max_positions,
                 "skipped_splits": n_skipped_splits,
+                "include_hidden_states": use_hidden,
                 "corpus": type(corpus).__name__,
                 "config": cfg,
             },

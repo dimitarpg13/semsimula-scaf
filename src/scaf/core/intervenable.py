@@ -249,6 +249,18 @@ class InterventableModel:
         self.n_forwards += 1
         return self.adapter.forward_logits(self.model, x)
 
+    def batch_logits_with_trajectory(
+        self, tokens: Sequence[Sequence[int]] | torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return ``(logits, [h_0, ..., h_L])`` for a batch.
+
+        Requires ``Capabilities.has_hidden_states``. Each ``h_ℓ`` has shape
+        ``(B, T, d)`` — the hidden state after layer ``ℓ``.
+        """
+        x = self._as_tokens(tokens)
+        self.n_forwards += 1
+        return self.adapter.forward_with_trajectory(self.model, x)
+
     def _as_tokens(self, tokens) -> torch.Tensor:
         # Note the deliberate absence of torch.from_numpy: it fails when torch
         # and NumPy disagree on major version. as_tensor with an explicit dtype
