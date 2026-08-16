@@ -5,7 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from torch import nn
+
 import scaf
+from scaf.core.adapters import fock as fock_adapter_module
 from scaf.core.corpus import SyntheticCorpus
 from scaf.probes.basin_membership import assign_dominant_wells
 from tests.toy_models import (
@@ -126,6 +129,129 @@ def test_plain_model_does_not_expose_vtheta_wells():
     """A plain causal model without wells should not claim has_vtheta_wells."""
     with _im(CausalToyLM(CFG)) as im:
         assert not im.caps.has_vtheta_wells
+
+
+# ---------------------------------------------------------------------------
+# Isotropic Gaussian V_theta compatibility
+# ---------------------------------------------------------------------------
+# The real research repo has two Gaussian V_theta families:
+#   - isotropic  (model_gaussian_vtheta.py): _components() -> (mu, a, w)
+#     — diagonal precision only, no low-rank term.
+#   - anisotropic (colab_fock_aniso_gaussian_*.ipynb): _components() ->
+#     (mu, a, w, B) — adds a low-rank correction.
+# FockAdapter.well_parameters() must handle both without crashing, since a
+# checkpoint's V_theta family is only known at load time.
+
+class _IsoBank(nn.Module):
+    """Structural stand-in for the isotropic `MixtureGaussianVTheta`.
+
+    Mirrors the real class closely enough to exercise
+    `FockAdapter.well_parameters()`'s actual unpacking logic: `_components`
+    returns a bare 3-tuple, and `mu_proj` is the structural marker
+    `_has_gaussian_wells` looks for.
+    """
+
+    def __init__(self, d: int, K: int):
+        super().__init__()
+        self.d, self.K = d, K
+        self.mu_proj = nn.Linear(d, K * d)
+        self.a_proj = nn.Linear(d, K * d)
+        self.w_proj = nn.Linear(d, K)
+
+    def _components(self, xi):
+        lead = xi.shape[:-1]
+        mu = self.mu_proj(xi).view(*lead, self.K, self.d)
+        a = torch.nn.functional.softplus(self.a_proj(xi)).view(*lead, self.K, self.d) + 1e-4
+        w = torch.softmax(self.w_proj(xi), dim=-1)
+        return mu, a, w  # 3-tuple: no low-rank term
+
+
+class _IsoMultiContext(nn.Module):
+    def __init__(self, d: int, K: int, n_ctx: int):
+        super().__init__()
+        self.banks = nn.ModuleList(_IsoBank(d, K) for _ in range(n_ctx))
+
+
+class _IsoDepthConditioned(nn.Module):
+    def __init__(self, d: int, K: int, n_ctx: int, n_layers: int):
+        super().__init__()
+        self.bank = _IsoMultiContext(d, K, n_ctx)
+        self.n_ctx, self.d, self.n_layers = n_ctx, d, n_layers
+        self.depth_code = nn.Parameter(torch.randn(n_layers, n_ctx, d) * 0.02)
+        self._active_layer = 0
+
+    def set_active_layer(self, layer_idx: int) -> None:
+        self._active_layer = int(layer_idx)
+
+    def _shift(self, xis):
+        code = self.depth_code[self._active_layer % self.n_layers]
+        lead = xis.dim() - 2
+        return xis + code.view(*([1] * lead), self.n_ctx, self.d)
+
+
+class _IsoXiModule(nn.Module):
+    """Maps token ids to (B, T, n_ctx, d) context vectors."""
+
+    def __init__(self, vocab_size: int, d: int, n_ctx: int):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, d)
+        self.proj = nn.Linear(d, n_ctx * d)
+        self.n_ctx, self.d = n_ctx, d
+
+    def forward(self, x):
+        B, T = x.shape
+        flat = self.proj(self.emb(x))
+        return flat.view(B, T, self.n_ctx, self.d)
+
+
+class _IsoFockModel(nn.Module):
+    """Minimal model with an isotropic Gaussian V_theta, for adapter tests."""
+
+    def __init__(self, d: int = 8, K: int = 2, n_ctx: int = 2, n_layers: int = 2):
+        super().__init__()
+        self.V_theta = _IsoDepthConditioned(d, K, n_ctx, n_layers)
+        self.xi_module = _IsoXiModule(24, d, n_ctx)
+        self._n_ctx, self._d = n_ctx, d
+
+    def forward(self, x):
+        raise NotImplementedError
+
+
+class TestIsotropicWellParameters:
+    """Regression coverage for the 3-tuple vs 4-tuple _components split."""
+
+    def test_has_gaussian_wells_detects_isotropic_bank(self):
+        model = _IsoFockModel()
+        assert fock_adapter_module._has_gaussian_wells(model)
+
+    def test_well_parameters_does_not_crash_on_3tuple_components(self):
+        """This is the exact bug: unconditionally unpacking 4 values from a
+        3-tuple raises `ValueError: not enough values to unpack`."""
+        model = _IsoFockModel(d=8, K=2, n_ctx=2, n_layers=2)
+        adapter = scaf.FockAdapter()
+
+        x = torch.randint(0, 24, (2, 6))
+        wp = adapter.well_parameters(model, 0, x)
+
+        assert wp is not None
+        K_total = model.V_theta.bank.banks[0].K * model._n_ctx
+        assert wp["mu"].shape[-2] == K_total
+        assert wp["precision_lr"].shape[-1] == 0, (
+            "isotropic bank should synthesise a rank-0 low-rank factor"
+        )
+
+    def test_assign_dominant_wells_handles_rank_zero_precision(self):
+        """A rank-0 precision_lr must contribute exactly zero to the score,
+        i.e. the isotropic fallback reduces to pure diagonal Mahalanobis."""
+        K, d = 2, 8
+        mu = torch.randn(K, d)
+        a = torch.ones(K, d)
+        B_rank0 = mu.new_zeros(K, d, 0)
+        w = torch.ones(K) / K
+
+        h = torch.randn(3, d)
+        result = assign_dominant_wells(h, mu, a, B_rank0, w)
+        assert result.shape == (3,)
 
 
 # ---------------------------------------------------------------------------
