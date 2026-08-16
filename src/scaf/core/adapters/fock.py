@@ -72,6 +72,27 @@ def _has_gaussian_wells(model: nn.Module) -> bool:
     return hasattr(bank, "_components") and hasattr(bank, "mu_proj")
 
 
+def _unpack_components(
+    bank: nn.Module, xi: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Call ``bank._components(xi)`` and normalise to a 4-tuple.
+
+    The isotropic Gaussian family (``MixtureGaussianVTheta``) returns
+    ``(mu, a, w)`` — diagonal precision only, no low-rank term. The
+    anisotropic family returns ``(mu, a, w, B)``. A rank-0 ``B`` is
+    synthesised for the isotropic case so callers can treat both
+    uniformly: ``einsum('...kd,...kdr->...kr', diff, B)`` with an
+    empty last dimension contributes exactly zero to the quadratic form,
+    which is precision-mathematically correct (no low-rank correction).
+    """
+    out = bank._components(xi)  # noqa: SLF001
+    if len(out) == 4:
+        return out
+    mu, a, w = out
+    B = mu.new_zeros(*mu.shape, 0)
+    return mu, a, w, B
+
+
 def _first_attr(model: nn.Module, names: Iterable[str]) -> str | None:
     for n in names:
         if getattr(model, n, None) is not None:
@@ -233,9 +254,18 @@ class FockAdapter(ModelAdapter):
         Handles three model shapes:
 
         1. ``model.well_parameters(layer_idx, x)`` — explicit API (toy models).
-        2. ``AnisotropicDepthConditionedGaussianVTheta`` — sets active layer,
-           derives ``xi`` from ``x``, calls ``bank._components``.
+        2. ``*DepthConditionedGaussianVTheta`` (isotropic or anisotropic) —
+           sets active layer, derives ``xi`` from ``x``, calls
+           ``bank._components``.
         3. Returns ``None`` if the model has no Gaussian wells.
+
+        ``_components`` returns a 3-tuple ``(mu, a, w)`` for the isotropic
+        family (``MixtureGaussianVTheta`` — diagonal precision only) and a
+        4-tuple ``(mu, a, w, B)`` for the anisotropic family (adds a
+        low-rank factor). The isotropic case is normalised to a zero-rank
+        ``B`` so :func:`~scaf.probes.basin_membership.assign_dominant_wells`
+        can treat both uniformly: the low-rank quadratic term vanishes and
+        the Mahalanobis distance reduces to the pure diagonal form.
         """
         if hasattr(model, "well_parameters"):
             return model.well_parameters(layer_idx, x)
@@ -266,7 +296,7 @@ class FockAdapter(ModelAdapter):
             all_mu, all_a, all_w, all_B = [], [], [], []
             for m_idx, head in enumerate(heads):
                 xi_head = xi_shifted[..., m_idx, :]
-                mu, a, w, B = head._components(xi_head)  # noqa: SLF001
+                mu, a, w, B = _unpack_components(head, xi_head)
                 all_mu.append(mu)
                 all_a.append(a)
                 all_w.append(w)
@@ -276,7 +306,7 @@ class FockAdapter(ModelAdapter):
             w = torch.cat(all_w, dim=-1)
             B = torch.cat(all_B, dim=-3)
         elif hasattr(bank, "_components"):
-            mu, a, w, B = bank._components(xi_shifted)  # noqa: SLF001
+            mu, a, w, B = _unpack_components(bank, xi_shifted)
         else:
             return None
 
