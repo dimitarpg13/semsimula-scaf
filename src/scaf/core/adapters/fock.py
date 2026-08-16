@@ -51,6 +51,27 @@ _EXCHANGE_MARKERS = ("exchange_force", "exchange_scale")
 _CLAMPABLE_GATES = ("reverse_channel_scale", "exchange_scale")
 
 
+def _has_gaussian_wells(model: nn.Module) -> bool:
+    """Check whether the model's V_theta exposes Gaussian well parameters.
+
+    True for models using ``AnisotropicDepthConditionedGaussianVTheta`` or
+    ``AnisotropicMultiContextGaussianVTheta`` — detected structurally via
+    ``_components`` and ``mu_proj``.  Also true for toy models that expose
+    ``well_parameters`` directly.
+    """
+    vtheta = getattr(model, "V_theta", None)
+    if vtheta is None:
+        return hasattr(model, "well_parameters")
+    # AnisotropicDepthConditioned wraps a bank; the bank wraps per-head banks.
+    bank = getattr(vtheta, "bank", vtheta)
+    if hasattr(bank, "banks"):
+        # AnisotropicMultiContextGaussianVTheta — check the first head
+        heads = bank.banks
+        if hasattr(heads, "__getitem__") and len(heads) > 0:
+            bank = heads[0]
+    return hasattr(bank, "_components") and hasattr(bank, "mu_proj")
+
+
 def _first_attr(model: nn.Module, names: Iterable[str]) -> str | None:
     for n in names:
         if getattr(model, n, None) is not None:
@@ -130,6 +151,7 @@ class FockAdapter(ModelAdapter):
             hasattr(model, "_stack_forward")
             or hasattr(model, "forward_with_trajectory")
         )
+        has_wells = _has_gaussian_wells(model)
 
         return Capabilities(
             requires_grad_forward=True,
@@ -138,6 +160,7 @@ class FockAdapter(ModelAdapter):
             has_reverse_channel=has_reverse,
             has_attention=getattr(model, "attn_blocks", None) is not None,
             has_hidden_states=has_trajectory,
+            has_vtheta_wells=has_wells,
             mediators=tuple(mediators),
             causal_flags=flags,
             notes=tuple(notes),
@@ -200,6 +223,69 @@ class FockAdapter(ModelAdapter):
                     param.fill_(value)
                     found = True
         return found
+
+    # ------------------------------------------------------------------
+    def well_parameters(
+        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        """Extract Gaussian well parameters for a given layer.
+
+        Handles three model shapes:
+
+        1. ``model.well_parameters(layer_idx, x)`` — explicit API (toy models).
+        2. ``AnisotropicDepthConditionedGaussianVTheta`` — sets active layer,
+           derives ``xi`` from ``x``, calls ``bank._components``.
+        3. Returns ``None`` if the model has no Gaussian wells.
+        """
+        if hasattr(model, "well_parameters"):
+            return model.well_parameters(layer_idx, x)
+
+        vtheta = getattr(model, "V_theta", None)
+        if vtheta is None:
+            return None
+
+        xi_mod = getattr(model, "xi_module", None)
+        if xi_mod is None:
+            return None
+
+        with torch.no_grad():
+            xi = xi_mod(x)
+
+        # DepthConditioned: set the layer and apply the depth-code shift
+        if hasattr(vtheta, "set_active_layer") and hasattr(vtheta, "_shift"):
+            vtheta.set_active_layer(layer_idx)
+            xi_shifted = vtheta._shift(xi)  # noqa: SLF001
+        else:
+            xi_shifted = xi
+
+        # Reach the actual Gaussian bank that has _components
+        bank = getattr(vtheta, "bank", vtheta)
+        if hasattr(bank, "banks"):
+            # MultiContext: extract from each head and concatenate
+            heads = bank.banks
+            all_mu, all_a, all_w, all_B = [], [], [], []
+            for m_idx, head in enumerate(heads):
+                xi_head = xi_shifted[..., m_idx, :]
+                mu, a, w, B = head._components(xi_head)  # noqa: SLF001
+                all_mu.append(mu)
+                all_a.append(a)
+                all_w.append(w)
+                all_B.append(B)
+            mu = torch.cat(all_mu, dim=-2)
+            a = torch.cat(all_a, dim=-2)
+            w = torch.cat(all_w, dim=-1)
+            B = torch.cat(all_B, dim=-3)
+        elif hasattr(bank, "_components"):
+            mu, a, w, B = bank._components(xi_shifted)  # noqa: SLF001
+        else:
+            return None
+
+        return {
+            "mu": mu.detach(),
+            "precision_diag": a.detach(),
+            "precision_lr": B.detach(),
+            "weights": w.detach(),
+        }
 
     # ------------------------------------------------------------------
     def forward_with_trajectory(

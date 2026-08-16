@@ -50,6 +50,7 @@ from .estimate.frames import LeakFrame, build_leak_frame
 from .estimate.pywhy import EstimationReport, RefutationResult, estimate_leak
 from .monitor import LeakMonitor
 from .probes.base import Probe, ProbeResult
+from .probes.basin_membership import BasinMembershipProbe
 from .probes.future_perturbation import FuturePerturbationProbe
 from .probes.hidden_state import HiddenStateLeakProbe
 from .probes.mediation import MediationProbe
@@ -79,6 +80,7 @@ __all__ = [
     "ProbeResult",
     "FuturePerturbationProbe",
     "HiddenStateLeakProbe",
+    "BasinMembershipProbe",
     "TargetRelocationProbe",
     "MediationProbe",
     # controls

@@ -62,6 +62,7 @@ from ..probes.future_perturbation import (
     _chunked_logits,
     make_perturbation_pairs,
 )
+from ..probes.basin_membership import assign_dominant_wells
 from ..probes.hidden_state import _chunked_trajectory, _cosine_deviation
 
 __all__ = ["LeakFrame", "build_leak_frame"]
@@ -450,6 +451,7 @@ def build_leak_frame(
     seed: int = 0,
     vocab_size: int | None = None,
     include_hidden_states: bool = False,
+    include_basin_membership: bool = False,
 ) -> LeakFrame:
     """Run the future-perturbation intervention and record it row by row.
 
@@ -488,6 +490,12 @@ def build_leak_frame(
             CATE-by-layer analysis works out of the box. When ``False``
             (default) or the adapter lacks trajectory support, the frame is
             unchanged.
+        include_basin_membership: When ``True`` and the adapter exposes
+            ``has_vtheta_wells``, the frame gains ``basin_changed``,
+            ``well_id_factual``, and ``well_id_counterfactual`` columns.
+            Implies ``include_hidden_states=True`` (basin assignment
+            requires per-layer hidden states). ``basin_changed`` is added
+            to ``effect_modifiers`` for CATE stratification.
 
     Returns:
         A :class:`LeakFrame`.
@@ -519,8 +527,15 @@ def build_leak_frame(
         )
         T = int(x.shape[1])
 
+        if include_basin_membership:
+            include_hidden_states = True
         use_hidden = (
             include_hidden_states and im.caps.has_hidden_states
+        )
+        use_basins = (
+            include_basin_membership
+            and use_hidden
+            and im.caps.has_vtheta_wells
         )
 
         col_names = [
@@ -530,6 +545,10 @@ def build_leak_frame(
         ]
         if use_hidden:
             col_names += ["hidden_cos_dev", "layer"]
+        if use_basins:
+            col_names += [
+                "basin_changed", "well_id_factual", "well_id_counterfactual",
+            ]
         cols: dict[str, list] = {k: [] for k in col_names}
         n_skipped_splits = 0
 
@@ -573,6 +592,32 @@ def build_leak_frame(
                         )
                         for ell in range(len(base_traj))
                     ]
+
+                # Pre-compute per-layer dominant well assignments.
+                wells_f_by_layer: list[torch.Tensor] | None = None
+                wells_c_by_layer: list[torch.Tensor] | None = None
+                if use_basins and base_traj is not None and cf_traj is not None:
+                    wells_f_by_layer = []
+                    wells_c_by_layer = []
+                    for ell in range(len(base_traj)):
+                        wp = im.adapter.well_parameters(im.model, ell, x)
+                        if wp is not None:
+                            wf = assign_dominant_wells(
+                                base_traj[ell][:, : t_p + 1],
+                                wp["mu"], wp["precision_diag"],
+                                wp["precision_lr"], wp["weights"],
+                            )
+                            wc = assign_dominant_wells(
+                                cf_traj[ell][:, : t_p + 1],
+                                wp["mu"], wp["precision_diag"],
+                                wp["precision_lr"], wp["weights"],
+                            )
+                            wells_f_by_layer.append(wf)
+                            wells_c_by_layer.append(wc)
+                        else:
+                            B_sz = base_traj[ell][:, : t_p + 1].shape[:2]
+                            wells_f_by_layer.append(torch.zeros(B_sz, dtype=torch.long))
+                            wells_c_by_layer.append(torch.zeros(B_sz, dtype=torch.long))
 
                 layers = (
                     list(range(len(base_traj)))
@@ -629,6 +674,23 @@ def build_leak_frame(
                                     cols["layer"].append(
                                         ell if ell is not None else -1
                                     )
+                                if use_basins:
+                                    if (
+                                        wells_f_by_layer is not None
+                                        and wells_c_by_layer is not None
+                                        and ell is not None
+                                        and t < wells_f_by_layer[ell].shape[-1]
+                                    ):
+                                        wf_val = int(wells_f_by_layer[ell][b, t])
+                                        wc_val = int(wells_c_by_layer[ell][b, t])
+                                    else:
+                                        wf_val = -1
+                                        wc_val = -1
+                                    cols["basin_changed"].append(
+                                        int(wf_val != wc_val)
+                                    )
+                                    cols["well_id_factual"].append(wf_val)
+                                    cols["well_id_counterfactual"].append(wc_val)
 
         if not cols["unit_id"]:
             raise ValueError(
@@ -643,6 +705,8 @@ def build_leak_frame(
         )
         if use_hidden:
             modifiers = modifiers + ("layer",)
+        if use_basins:
+            modifiers = modifiers + ("basin_changed",)
 
         frame = LeakFrame(
             columns=cols,
@@ -659,6 +723,7 @@ def build_leak_frame(
                 "max_positions": max_positions,
                 "skipped_splits": n_skipped_splits,
                 "include_hidden_states": use_hidden,
+                "include_basin_membership": use_basins,
                 "corpus": type(corpus).__name__,
                 "config": cfg,
             },

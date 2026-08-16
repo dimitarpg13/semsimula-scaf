@@ -45,6 +45,7 @@ import torch
 from .controls import DeterminismControl, PlaceboControl, PositiveControl
 from .core.corpus import Corpus, SyntheticCorpus, TokenCorpus
 from .core.intervenable import InterventableModel
+from .probes.basin_membership import BasinMembershipProbe
 from .probes.future_perturbation import FuturePerturbationProbe
 from .probes.hidden_state import HiddenStateLeakProbe
 from .probes.target_relocation import TargetRelocationProbe
@@ -119,6 +120,11 @@ class LeakMonitor:
             the adapter does not support trajectories, this is silently
             ignored (the probe skips rather than crashes). Cheap enough for
             every eval step: uses a single split and a single pair.
+        basin_membership_probe: Also run the Tier B basin-membership probe.
+            Requires ``has_vtheta_wells``. When the adapter does not expose
+            well parameters, this is silently ignored. Basin crossings are
+            reported as diagnostics — they characterise the severity of a
+            detected leak but do not override the logit-level verdict.
         honest_ppl: Also run the target-relocation stage, which reports the
             leak tax in nats and the honest perplexity. This is the stage that
             exposed the original register leak after the perturbation test
@@ -162,6 +168,7 @@ class LeakMonitor:
         n_pairs: int = 1,
         micro_batch: int = 2,
         hidden_state_probe: bool = True,
+        basin_membership_probe: bool = True,
         honest_ppl: bool = True,
         honest_ppl_interval: int | None = None,
         n_targets: int = 16,
@@ -186,6 +193,7 @@ class LeakMonitor:
         self.n_pairs = n_pairs
         self.micro_batch = micro_batch
         self.hidden_state_probe = hidden_state_probe
+        self.basin_membership_probe = basin_membership_probe
         self.honest_ppl = honest_ppl
         self.honest_ppl_interval = int(honest_ppl_interval or interval)
         self.n_targets = n_targets
@@ -346,6 +354,18 @@ class LeakMonitor:
                     )
                 except Exception:  # noqa: BLE001 - geometric probe must not crash the monitor
                     pass
+            if self.basin_membership_probe and im.caps.has_vtheta_wells:
+                try:
+                    diagnostics.append(
+                        BasinMembershipProbe(
+                            splits=self.splits,
+                            n_seqs=self.n_seqs,
+                            n_pairs=self.n_pairs,
+                            micro_batch=self.micro_batch,
+                        ).run(im, self.corpus)
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             if want_honest:
                 probes.append(
                     TargetRelocationProbe(
@@ -383,6 +403,9 @@ class LeakMonitor:
         hs = next(
             (d for d in diagnostics if d.name == "hidden_state_leak"), None
         )
+        bm = next(
+            (d for d in diagnostics if d.name == "basin_membership"), None
+        )
         tr = next((p for p in probes if p.name == "target_relocation"), None)
 
         record: dict[str, Any] = {
@@ -408,6 +431,12 @@ class LeakMonitor:
                 "per_layer_delta_cos"
             )
             record["latent_leak"] = hs.detail.get("latent_leak", False)
+        if bm is not None and not bm.skipped:
+            record["basin_crossing_rate"] = bm.statistic
+            record["basin_worst_layer"] = bm.detail.get("worst_layer")
+            record["per_layer_crossing_rate"] = bm.detail.get(
+                "per_layer_crossing_rate"
+            )
         if tr is not None and not tr.skipped:
             record.update(
                 tau_leak=tr.statistic,
@@ -448,12 +477,17 @@ class LeakMonitor:
         if not self.history:
             return "SCAF LeakMonitor — no measurements yet"
         has_cos = any(r.get("max_cos_dev") is not None for r in self.history)
+        has_basin = any(
+            r.get("basin_crossing_rate") is not None for r in self.history
+        )
         header = (
             f"{'step':>9}  {'verdict':<8} {'linf':>11} {'AILE':>11} "
             f"{'tau_leak':>10}"
         )
         if has_cos:
             header += f" {'cos_dev':>10} {'peak_L':>6}"
+        if has_basin:
+            header += f" {'beta':>10} {'b_peak':>6}"
         lines = [
             f"SCAF LeakMonitor — {len(self.history)} measurements, "
             f"every {self.interval} steps",
@@ -472,6 +506,13 @@ class LeakMonitor:
                 row += (
                     f" {_fmt(cos):>10}"
                     f" {(str(pk) if pk is not None else '-'):>6}"
+                )
+            if has_basin:
+                beta = r.get("basin_crossing_rate")
+                bpk = r.get("basin_worst_layer")
+                row += (
+                    f" {_fmt(beta):>10}"
+                    f" {(str(bpk) if bpk is not None else '-'):>6}"
                 )
             lines.append(row)
         first = self.first_leak_step

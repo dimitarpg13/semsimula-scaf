@@ -77,6 +77,7 @@ class GenericAdapter(ModelAdapter):
             hasattr(model, "_stack_forward")
             or hasattr(model, "forward_with_trajectory")
         )
+        has_wells = hasattr(model, "well_parameters")
 
         return Capabilities(
             requires_grad_forward=True,
@@ -88,6 +89,7 @@ class GenericAdapter(ModelAdapter):
             ),
             has_attention=getattr(model, "attn_blocks", None) is not None,
             has_hidden_states=has_trajectory,
+            has_vtheta_wells=has_wells,
             mediators=mediators,
             causal_flags=flags,
             notes=tuple(notes),
@@ -104,6 +106,14 @@ class GenericAdapter(ModelAdapter):
             trajectory = [h.detach() for h in out[1]]
             return logits, trajectory
         return super().forward_with_trajectory(model, x)
+
+    def well_parameters(
+        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        """Delegate to the model's own ``well_parameters`` if it exists."""
+        if hasattr(model, "well_parameters"):
+            return model.well_parameters(layer_idx, x)
+        return None
 
     def intervention_points(
         self, model: nn.Module
