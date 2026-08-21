@@ -128,6 +128,28 @@ def assign_dominant_wells(
     return score.argmin(dim=-1)  # (...,)
 
 
+#: Rank of each well-parameter tensor once a per-position time axis is
+#: present: ``mu``/``precision_diag`` are ``(B, T, K, d)``, ``precision_lr``
+#: adds the low-rank axis, ``weights`` drops ``d``.
+_WELL_TIME_RANK = {
+    "mu": 4, "precision_diag": 4, "precision_lr": 5, "weights": 3,
+}
+
+
+def _truncate_wells(wp: dict, t_end: int) -> dict:
+    """Cut context-dependent wells down to the positions being scored.
+
+    Wells derived from ``xi`` carry one landscape per position, so they must
+    be sliced alongside the hidden states; context-free wells (the toys, and
+    any model whose landscape is a bare parameter) have no time axis and are
+    broadcast as-is.
+    """
+    return {
+        k: (v[:, :t_end] if v.dim() == _WELL_TIME_RANK[k] else v)
+        for k, v in wp.items()
+    }
+
+
 def measure_basin_crossings(
     im,
     x: torch.Tensor,
@@ -156,20 +178,31 @@ def measure_basin_crossings(
         _, cf_traj = _chunked_trajectory(im, x_cf, micro_batch)
 
         for ell in range(n_layers):
-            wp = im.adapter.well_parameters(im.model, ell, x)
-            if wp is None:
+            # Each arm is scored in its own landscape. The wells are a
+            # function of xi, which is a function of the hidden state, so a
+            # future perturbation moves the landscape as well as the point in
+            # it. Holding the wells at their factual values would miss a leak
+            # that travels through xi and would answer a different question
+            # than "is this position in the same basin in both worlds".
+            wp_f = im.adapter.well_parameters(im.model, ell, x, h=base_traj[ell])
+            wp_c = im.adapter.well_parameters(
+                im.model, ell, x_cf, h=cf_traj[ell]
+            )
+            if wp_f is None or wp_c is None:
                 continue
 
             h_f = base_traj[ell][:, : t_p + 1]
             h_c = cf_traj[ell][:, : t_p + 1]
+            wp_f = _truncate_wells(wp_f, t_p + 1)
+            wp_c = _truncate_wells(wp_c, t_p + 1)
 
             wells_f = assign_dominant_wells(
-                h_f, wp["mu"], wp["precision_diag"],
-                wp["precision_lr"], wp["weights"],
+                h_f, wp_f["mu"], wp_f["precision_diag"],
+                wp_f["precision_lr"], wp_f["weights"],
             )
             wells_c = assign_dominant_wells(
-                h_c, wp["mu"], wp["precision_diag"],
-                wp["precision_lr"], wp["weights"],
+                h_c, wp_c["mu"], wp_c["precision_diag"],
+                wp_c["precision_lr"], wp_c["weights"],
             )
 
             crossed = (wells_f != wells_c).float()

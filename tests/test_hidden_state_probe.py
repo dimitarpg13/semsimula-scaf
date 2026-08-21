@@ -7,6 +7,7 @@ import torch
 
 import scaf
 from scaf.core.corpus import SyntheticCorpus
+from scaf.probes.hidden_state import _cosine_deviation
 from tests.toy_models import (
     CausalToyLM,
     FockLikeToyLM,
@@ -45,23 +46,42 @@ def test_causal_model_exposes_hidden_states():
 # Hidden-state probe on causal model
 # ---------------------------------------------------------------------------
 def test_causal_model_shows_zero_cosine_deviation():
-    """The hidden-state analogue of the linf=0 guarantee.
+    """The hidden-state analogue of the linf=0 guarantee, at the *default*
+    threshold of exactly zero.
 
-    Unlike logit L∞ (which is bit-exact zero for a causal model because the
-    logit tensors are the same object), cosine similarity involves a division
-    that introduces rounding at machine epsilon. The threshold must absorb
-    this, which is why HiddenStateLeakProbe accepts a tolerance.
+    This test used to pass a hand-picked tolerance, which is precisely how the
+    default went unexercised: the probe ships with ``threshold=0.0``, so any
+    epsilon residue fails every model. See
+    :func:`test_identical_states_deviate_by_exactly_zero`.
     """
-    EPS = 1e-12
     with _im(CausalToyLM(CFG)) as im:
         r = scaf.HiddenStateLeakProbe(
-            n_seqs=4, n_pairs=1, threshold=EPS, micro_batch=0
+            n_seqs=4, n_pairs=1, micro_batch=0
         ).run(im, _corpus())
-    assert r.statistic < EPS, f"expected near-zero, got {r.statistic}"
+    assert r.statistic == 0.0, f"expected exact zero, got {r.statistic}"
     assert r.passed
     assert not r.detail["latent_leak"]
     for layer_dev in r.detail["per_layer_delta_cos"]:
-        assert layer_dev < EPS
+        assert layer_dev == 0.0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_identical_states_deviate_by_exactly_zero(dtype):
+    """``cos(h, h)`` is not exactly 1, but the deviation must be exactly 0.
+
+    A cosine divides two separately-accumulated reductions, so the residue
+    grows with the hidden width — at d=384 in float32 it is a few times 1e-7,
+    far above the probe's exact-zero threshold. A causal model produces
+    bit-identical past states, so that residue is pure arithmetic and would
+    otherwise fail every model, clean ones included.
+    """
+    h = torch.randn(2, 8, 384, dtype=dtype)
+    dev = _cosine_deviation(h, h.clone())
+    assert dev.abs().max().item() == 0.0
+
+    moved = h.clone()
+    moved[0, 0] += 1.0
+    assert _cosine_deviation(h, moved)[0, 0].item() > 0.0
 
 
 # ---------------------------------------------------------------------------

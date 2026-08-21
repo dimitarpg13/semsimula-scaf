@@ -28,7 +28,18 @@ from torch import nn
 
 from .adapters import ModelAdapter, resolve_adapter
 
-__all__ = ["InterventableModel", "resolve_dtype"]
+__all__ = ["InertIntervention", "InterventableModel", "resolve_dtype"]
+
+
+class InertIntervention(RuntimeError):
+    """Raised when an intervention was registered but never actually applied.
+
+    A distinct type, rather than a bare ``RuntimeError``, so callers can tell
+    "this knockout did nothing because the point is unreachable" from "the
+    model raised while running the knockout". The first is a statement about
+    the adapter's intervention surface and must never be read as the component
+    being innocent; the second is a genuine failure that should propagate.
+    """
 
 TensorEdit = Callable[[torch.Tensor], torch.Tensor]
 
@@ -58,6 +69,24 @@ def resolve_dtype(dtype):
 def zero_out(t: torch.Tensor) -> torch.Tensor:
     """Edit function that knocks a tensor out entirely."""
     return torch.zeros_like(t)
+
+
+def _hookable_targets(module: nn.Module) -> list[nn.Module]:
+    """Expand pure containers into the children that actually run.
+
+    ``nn.ModuleList`` and ``nn.ModuleDict`` are indexed, never called: their
+    ``forward`` raises. A hook registered on the container is therefore dead,
+    and a per-layer gate stack (``destruction_gates[l](r)``) would look
+    intervenable while being untouchable. Hooking the children instead applies
+    the edit at every layer, which is what knocking out "the destruction
+    gates" means.
+    """
+    if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+        targets: list[nn.Module] = []
+        for child in module.children():
+            targets.extend(_hookable_targets(child))
+        return targets
+    return [module]
 
 
 class InterventableModel:
@@ -106,16 +135,28 @@ class InterventableModel:
 
         self._edits: dict[str, TensorEdit] = {}
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
-        self._points: dict[str, nn.Module] = {}
+        self._points: dict[str, list[nn.Module]] = {}
+        self._patched: list[tuple[nn.Module, str]] = []
+        self._fired: set[str] = set()
         self._params: dict[str, nn.Parameter] = dict(
             self.adapter.parameter_interventions(self.model)
         )
 
         for name, module in self.adapter.intervention_points(self.model):
-            self._points[name] = module
-            self._handles.append(
-                module.register_forward_hook(self._make_hook(name))
-            )
+            targets = _hookable_targets(module)
+            self._points.setdefault(name, []).extend(targets)
+            for target in targets:
+                self._handles.append(
+                    target.register_forward_hook(self._make_hook(name))
+                )
+
+        # Entry points that bypass __call__ and would therefore never see a
+        # forward hook. See ModelAdapter.intervention_methods.
+        for name, module, method_name in self.adapter.intervention_methods(
+            self.model
+        ):
+            self._points.setdefault(name, [])
+            self._patch_method(name, module, method_name)
 
         self.n_forwards = 0
 
@@ -143,17 +184,38 @@ class InterventableModel:
     # ------------------------------------------------------------------
     # Do-operations
     # ------------------------------------------------------------------
+    def _apply(self, name: str, output):
+        """Record that ``name``'s entry point ran, and apply any pending edit."""
+        self._fired.add(name)
+        fn = self._edits.get(name)
+        if fn is None:
+            return output
+        if isinstance(output, tuple):
+            # Edit only the primary tensor of a tuple-returning module.
+            return (fn(output[0]), *output[1:])
+        return fn(output)
+
     def _make_hook(self, name: str):
         def hook(_module, _inputs, output):
-            fn = self._edits.get(name)
-            if fn is None:
-                return output
-            if isinstance(output, tuple):
-                # Edit only the primary tensor of a tuple-returning module.
-                return (fn(output[0]), *output[1:])
-            return fn(output)
+            return self._apply(name, output)
 
         return hook
+
+    def _patch_method(self, name: str, module: nn.Module, method_name: str):
+        """Route ``module.method_name`` through the edit machinery.
+
+        The wrapper is installed as an instance attribute, shadowing the bound
+        class method, and removed again by :meth:`close`.
+        """
+        original = getattr(module, method_name)
+
+        def wrapper(*args, **kwargs):
+            return self._apply(name, original(*args, **kwargs))
+
+        wrapper.__name__ = getattr(original, "__name__", method_name)
+        wrapper.__scaf_wrapped__ = original
+        setattr(module, method_name, wrapper)
+        self._patched.append((module, method_name))
 
     @contextlib.contextmanager
     def do(self, **edits: TensorEdit) -> Iterator[InterventableModel]:
@@ -168,6 +230,13 @@ class InterventableModel:
             KeyError: if a name is not an intervention point. Failing loudly
                 matters here: a silently-ignored knockout would make a leaky
                 model look clean.
+            InertIntervention: on exit, if forwards ran inside the block but
+                an edited point never fired. Knowing a point *exists* is not the
+                same as knowing it was *reached*: a module invoked through a
+                bypass method, or one whose container is never called, accepts
+                a hook that no forward pass will ever trigger. The block then
+                measures the unintervened model while reporting an
+                intervention, which is a false all-clear (axiom A7).
         """
         unknown = set(edits) - set(self._points)
         if unknown:
@@ -177,10 +246,28 @@ class InterventableModel:
             )
         prev = self._edits
         self._edits = {**self._edits, **edits}
+        self._fired -= set(edits)
+        n_before = self.n_forwards
         try:
             yield self
         finally:
             self._edits = prev
+
+        # Reached only on a clean exit, so an in-flight exception (which may
+        # be why no forward ran) propagates untouched rather than being
+        # replaced by a confusing report about a silent intervention.
+        n_ran = self.n_forwards - n_before
+        silent = sorted(set(edits) - self._fired)
+        if n_ran and silent:
+            raise InertIntervention(
+                f"Intervention point(s) {silent} never fired during {n_ran} "
+                f"forward pass(es), so the do-operation was a no-op and any "
+                f"result measured inside the block reflects the unmodified "
+                f"model. This usually means the module is invoked through a "
+                f"method that bypasses __call__ (declare it in the adapter's "
+                f"intervention_methods) or is not reached in the model's "
+                f"current configuration (drop it from intervention_points)."
+            )
 
     @contextlib.contextmanager
     def clamp(self, **values: float) -> Iterator[InterventableModel]:
@@ -283,10 +370,15 @@ class InterventableModel:
         return self.adapter.deterministic(self.model)
 
     def close(self) -> None:
-        """Remove hooks and optionally restore the original dtype."""
+        """Remove hooks and method patches, and optionally restore the dtype."""
         for h in self._handles:
             h.remove()
         self._handles.clear()
+        for module, method_name in self._patched:
+            wrapper = module.__dict__.get(method_name)
+            if wrapper is not None and hasattr(wrapper, "__scaf_wrapped__"):
+                delattr(module, method_name)
+        self._patched.clear()
         if self._restore_dtype and self.dtype != self._orig_dtype:
             self.model = self.model.to(dtype=self._orig_dtype)
             self.dtype = self._orig_dtype

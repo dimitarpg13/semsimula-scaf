@@ -179,6 +179,15 @@ class FockLikeToyLM(LeakyToyLM):
 
     The gate is initialised open so the model leaks by default and is a
     meaningful subject for :class:`~scaf.MediationProbe`.
+
+    Both named modules are actually *invoked*, and that is load-bearing.
+    ``reverse_ch`` transports the pooled future into the past, so it is the
+    leak's carrier and zeroing its output is a real knockout; ``creation_gate``
+    sits on the prefix path, so it runs on every forward but cannot reduce the
+    leak. An earlier version of this toy merely declared the two as unused
+    ``nn.Identity`` attributes to satisfy adapter detection. That reproduced,
+    in miniature, exactly the defect the real adapter had — a module hooked but
+    never called — and left the module-output knockout path untested.
     """
 
     def __init__(
@@ -195,19 +204,18 @@ class FockLikeToyLM(LeakyToyLM):
             torch.full((1,), float(gate_init))
         )
 
-    def forward(self, x):
-        h = self.emb(x)
+    def _mix(self, h):
         global_pool = h.mean(dim=1, keepdim=True)
         gate = torch.tanh(self.reverse_channel_scale).view(1, 1, 1)
-        return self.out(
-            self._prefix_mean(h) + self.leak_scale * gate * global_pool
-        ), None
+        leak = self.leak_scale * gate * self.reverse_ch(global_pool)
+        return self.creation_gate(self._prefix_mean(h)) + leak
+
+    def forward(self, x):
+        return self.out(self._mix(self.emb(x))), None
 
     def forward_with_trajectory(self, x):
         h = self.emb(x)
-        global_pool = h.mean(dim=1, keepdim=True)
-        gate = torch.tanh(self.reverse_channel_scale).view(1, 1, 1)
-        h_out = self._prefix_mean(h) + self.leak_scale * gate * global_pool
+        h_out = self._mix(h)
         return self.out(h_out), [h, h_out]
 
 

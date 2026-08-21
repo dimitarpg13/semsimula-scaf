@@ -108,7 +108,11 @@ class GenericAdapter(ModelAdapter):
         return super().forward_with_trajectory(model, x)
 
     def well_parameters(
-        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor] | None:
         """Delegate to the model's own ``well_parameters`` if it exists."""
         if hasattr(model, "well_parameters"):
