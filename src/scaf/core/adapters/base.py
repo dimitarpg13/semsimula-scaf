@@ -142,6 +142,11 @@ class ModelAdapter(ABC):
             "vocab_size", "d", "L", "max_len", "causal_force",
             "prefix_causal_registers", "reverse_channel", "n_registers",
             "xi_channels", "top_k", "stack_discipline", "fock_version",
+            # Integrator identity: 'verlet' vs the BAOAB/CfC family. Two runs
+            # of the same architecture under different integrators are
+            # different dynamical systems, so an audit record that omits this
+            # cannot say which one it certified.
+            "integrator", "vtheta_analytic_force", "langevin_T",
         )
         return {k: getattr(cfg, k) for k in keys if hasattr(cfg, k)}
 
@@ -246,6 +251,27 @@ class ModelAdapter(ABC):
 
         Names become the keyword arguments accepted by
         :meth:`scaf.core.intervenable.InterventableModel.do`.
+        """
+        return ()
+
+    def intervention_methods(
+        self, model: nn.Module
+    ) -> Iterable[tuple[str, nn.Module, str]]:
+        """Yield ``(name, module, method_name)`` for entry points that bypass ``__call__``.
+
+        A forward hook only fires when a module is invoked through
+        ``__call__``. Several SemSimula modules are instead invoked through a
+        named method — ``V_phi.forward_gathered``, ``creation_gate_qkv.
+        forward_prefix``, ``V_theta.analytical_grad`` — chosen by a config
+        flag. A hook registered on such a module never fires, so a knockout
+        of it would be a silent no-op, which is exactly the false all-clear
+        axiom A7 exists to prevent.
+
+        Declaring the method here makes SCAF wrap it, so the edit applies to
+        whatever the module actually produces. Adapters should declare only
+        the methods that apply *in the model's current configuration*; if a
+        method and ``__call__`` both run during one pass, the edit is applied
+        to both, which is the intended semantics for a knockout.
         """
         return ()
 

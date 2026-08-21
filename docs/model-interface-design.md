@@ -208,6 +208,7 @@ class ModelAdapter(ABC):
     def forward_logits(self, model, x) -> torch.Tensor: ...
     def deterministic(self, model) -> ContextManager[None]: ...
     def intervention_points(self, model) -> Iterable[tuple[str, nn.Module]]: ...
+    def intervention_methods(self, model) -> Iterable[tuple[str, nn.Module, str]]: ...
     def parameter_interventions(self, model) -> Iterable[tuple[str, nn.Parameter]]: ...
     def declared_sources(self, layer, t, T) -> Iterable[PositionalNode]: ...
 ```
@@ -349,6 +350,36 @@ with im.knockout("reverse_channel_scale"):
     cde = future_perturbation.run(im, corpus)
 ```
 
+### Registered is not the same as reached
+
+A forward hook fires only when a module is invoked through `__call__`, and the
+Fock stack has three places where that does not happen:
+
+| Construct | Example | Consequence |
+|---|---|---|
+| Module held in an `nn.ModuleList` | `destruction_gates[l](r)` | the container's `forward` never runs, so a hook on it is dead |
+| Invocation through a named method | `V_phi.forward_gathered`, `creation_gate_qkv.forward_prefix`, `V_theta.analytical_grad` | `__call__` is bypassed entirely |
+| Component the config never reaches | v1 `creation_gates` on a v2 model | present as an attribute, absent from the forward |
+
+Each produced an intervention that registered cleanly and then did nothing, so
+the block measured the *unmodified* model while reporting a knockout. The
+resulting controlled direct effect equals the total effect and the mediator
+scores zero attribution — indistinguishable from a component that genuinely
+carries none of the leak. Under `prefix_causal_registers=True` and
+`use_gathered_v_phi=True`, both production settings, two of the four Fock
+mediators were inert this way.
+
+Two mechanisms close the gap. `intervention_points` entries that are pure
+containers are expanded to the children that actually run, and adapters declare
+bypass methods in `intervention_methods`, which SCAF wraps with the same edit
+logic. Declaring a method that the current config never calls is harmless, so
+the table is config-independent; what decides the outcome is the runtime check.
+
+That check is the backstop: on leaving `do()`, if forwards ran but an edited
+point never fired, SCAF raises `InertIntervention` rather than returning a
+number. `MediationProbe` catches it and lists the mediator under `never_fired`,
+excluded from attribution instead of scored as innocent.
+
 Comparing the total effect against `cde` gives the controlled direct effect and
 attributes the leak to a component — the formal version of
 `fock_leak_decompose.py`.
@@ -483,7 +514,9 @@ way; the fit is a smoother over it, not a better measurement of it.
 3. Implement `capabilities()`, listing the family's non-conservative components
    in `mediators`, most-suspect first.
 4. Override `intervention_points` and `parameter_interventions` to expose those
-   components.
+   components, and `intervention_methods` for any that the model reaches
+   through a named method rather than `__call__` — otherwise their hooks never
+   fire and `InertIntervention` will (correctly) refuse to score them.
 5. Override `declared_sources` only if the family legitimately deviates from
    the strict autoregressive triangle.
 6. Override `forward_logits` only if the model needs extra positional arguments.

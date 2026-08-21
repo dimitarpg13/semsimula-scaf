@@ -52,6 +52,7 @@ able to make a leaky model look better.
 
 from __future__ import annotations
 
+from ..core.intervenable import InertIntervention
 from .base import Probe, ProbeResult
 from .future_perturbation import (
     make_perturbation_pairs,
@@ -126,6 +127,7 @@ class MediationProbe(Probe):
 
             per_mediator: dict[str, dict[str, float]] = {}
             unavailable: list[str] = []
+            inert: list[str] = []
             for name in candidates:
                 try:
                     with im.knockout(name):
@@ -135,6 +137,15 @@ class MediationProbe(Probe):
                 except KeyError:
                     # Declared by capabilities but not actually intervenable.
                     unavailable.append(name)
+                    continue
+                except InertIntervention:
+                    # The point exists and was hooked, but no forward pass
+                    # reached it, so the "knockout" measured the untouched
+                    # model. Its CDE would equal the total effect and the
+                    # mediator would be scored at zero attribution —
+                    # indistinguishable from a component that genuinely
+                    # carries none of the leak. Record it as unmeasured.
+                    inert.append(name)
                     continue
                 per_mediator[name] = {
                     "cde": cde,
@@ -146,6 +157,7 @@ class MediationProbe(Probe):
             return self._skip(
                 f"none of the declared mediators {list(candidates)} could be "
                 "knocked out on this model"
+                + (f" ({inert} were hooked but never reached)" if inert else "")
             )
 
         ranked = sorted(
@@ -169,6 +181,13 @@ class MediationProbe(Probe):
             detail[f"attributed_{name}"] = m["attributed"]
         if unavailable:
             detail["not_intervenable"] = unavailable
+        if inert:
+            # Not folded into not_intervenable: that list means "this model has
+            # no such component", whereas these components exist and are
+            # advertised as mediators while being unreachable through the
+            # declared entry point. That is an adapter defect, and the
+            # attribution below is over the remaining mediators only.
+            detail["never_fired"] = inert
         if suppressors:
             detail["suppressors"] = suppressors
         # A knockout that fails to reduce the leak at all tells us the clamp
