@@ -62,7 +62,7 @@ from ..probes.future_perturbation import (
     _chunked_logits,
     make_perturbation_pairs,
 )
-from ..probes.basin_membership import assign_dominant_wells
+from ..probes.basin_membership import _truncate_wells, assign_dominant_wells
 from ..probes.hidden_state import _chunked_trajectory, _cosine_deviation
 
 __all__ = ["LeakFrame", "build_leak_frame"]
@@ -600,17 +600,27 @@ def build_leak_frame(
                     wells_f_by_layer = []
                     wells_c_by_layer = []
                     for ell in range(len(base_traj)):
-                        wp = im.adapter.well_parameters(im.model, ell, x)
-                        if wp is not None:
+                        # Each arm is scored in its own landscape: the wells
+                        # are functions of xi, so the perturbation moves them
+                        # too. See measure_basin_crossings.
+                        wp_f = im.adapter.well_parameters(
+                            im.model, ell, x, h=base_traj[ell]
+                        )
+                        wp_c = im.adapter.well_parameters(
+                            im.model, ell, x_cf, h=cf_traj[ell]
+                        )
+                        if wp_f is not None and wp_c is not None:
+                            wp_f = _truncate_wells(wp_f, t_p + 1)
+                            wp_c = _truncate_wells(wp_c, t_p + 1)
                             wf = assign_dominant_wells(
                                 base_traj[ell][:, : t_p + 1],
-                                wp["mu"], wp["precision_diag"],
-                                wp["precision_lr"], wp["weights"],
+                                wp_f["mu"], wp_f["precision_diag"],
+                                wp_f["precision_lr"], wp_f["weights"],
                             )
                             wc = assign_dominant_wells(
                                 cf_traj[ell][:, : t_p + 1],
-                                wp["mu"], wp["precision_diag"],
-                                wp["precision_lr"], wp["weights"],
+                                wp_c["mu"], wp_c["precision_diag"],
+                                wp_c["precision_lr"], wp_c["weights"],
                             )
                             wells_f_by_layer.append(wf)
                             wells_c_by_layer.append(wc)

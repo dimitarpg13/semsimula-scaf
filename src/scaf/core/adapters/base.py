@@ -194,27 +194,43 @@ class ModelAdapter(ABC):
         )
 
     def well_parameters(
-        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor] | None:
         """Return Gaussian well parameters for a given layer and input batch.
 
         For models with anisotropic Gaussian :math:`V_\\theta`, the well
         parameters are **context-dependent** — they are functions of the
-        learned context vectors ``xi``, which in turn depend on the input
-        tokens. This is why the input batch ``x`` is required: the adapter
-        re-derives ``xi`` from ``x`` to extract the well parameters that were
-        active during the original forward pass.
+        learned context vectors ``xi``, which the layer step derives from the
+        hidden state *entering that layer*, not from the tokens. The landscape
+        therefore differs at every layer and every position, and re-deriving
+        it needs ``h_ell``.
+
+        Callers that already ran the stack (every trajectory probe does) pass
+        that state as ``h``, shape ``(B, T, d)``. Callers that only hold the
+        tokens omit it and the adapter reconstructs the trajectory from ``x``,
+        which costs a full forward pass.
 
         Returns a dict with detached tensors::
 
             {
-                'mu':             (B, K, d)     — well centres,
-                'precision_diag': (B, K, d)     — diagonal precision ``a_k``,
-                'precision_lr':   (B, K, d, r)  — low-rank factor ``B_k``,
-                'weights':        (B, K)        — mixture weights,
+                'mu':             (B, T, K, d)     — well centres,
+                'precision_diag': (B, T, K, d)     — diagonal precision ``a_k``,
+                'precision_lr':   (B, T, K, d, r)  — low-rank factor ``B_k``,
+                'weights':        (B, T, K)        — mixture weights,
             }
 
-        or ``None`` if the model does not have Gaussian wells.
+        The time axis is absent for models whose wells are context-free, and
+        :func:`~scaf.probes.basin_membership.assign_dominant_wells` broadcasts
+        over whichever form it is handed.
+
+        Returns ``None`` if the model has no Gaussian wells, or if
+        ``layer_idx`` addresses no layer — a trajectory has ``L + 1`` entries
+        but only ``L`` layers, so the final hidden state has no landscape of
+        its own.
 
         The full precision matrix is :math:`\\Sigma_k^{-1} = \\mathrm{diag}(a_k) + B_k B_k^\\top`,
         but it is never materialised — the quadratic form is evaluated via the

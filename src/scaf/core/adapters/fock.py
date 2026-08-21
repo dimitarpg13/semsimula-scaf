@@ -332,7 +332,11 @@ class FockAdapter(ModelAdapter):
 
     # ------------------------------------------------------------------
     def well_parameters(
-        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor] | None:
         """Extract Gaussian well parameters for a given layer.
 
@@ -340,9 +344,14 @@ class FockAdapter(ModelAdapter):
 
         1. ``model.well_parameters(layer_idx, x)`` — explicit API (toy models).
         2. ``*DepthConditionedGaussianVTheta`` (isotropic or anisotropic) —
-           sets active layer, derives ``xi`` from ``x``, calls
-           ``bank._components``.
+           sets active layer, derives ``xi`` from the layer's hidden state,
+           calls ``bank._components``.
         3. Returns ``None`` if the model has no Gaussian wells.
+
+        The layer step computes ``xis = xi_module(h_ell)`` from the *hidden
+        state*, so ``xi_module`` takes ``(B, T, d)`` activations. Passing it
+        the ``(B, T)`` token batch instead raises inside the module, which is
+        what made Tier B unusable on every real multi-xi checkpoint.
 
         ``_components`` returns a 3-tuple ``(mu, a, w)`` for the isotropic
         family (``MixtureGaussianVTheta`` — diagonal precision only) and a
@@ -353,6 +362,8 @@ class FockAdapter(ModelAdapter):
         the Mahalanobis distance reduces to the pure diagonal form.
         """
         if hasattr(model, "well_parameters"):
+            if _accepts(model.well_parameters, "h"):
+                return model.well_parameters(layer_idx, x, h=h)
             return model.well_parameters(layer_idx, x)
 
         vtheta = getattr(model, "V_theta", None)
@@ -363,8 +374,27 @@ class FockAdapter(ModelAdapter):
         if xi_mod is None:
             return None
 
+        # A trajectory carries L+1 states but the depth code has L entries, so
+        # the final hidden state addresses no layer. The depth-conditioned
+        # V_theta wraps out-of-range indices modulo n_layers, which would
+        # silently hand back layer 0's landscape instead of saying "none".
+        n_layers = getattr(vtheta, "n_layers", None)
+        if n_layers is not None and not 0 <= layer_idx < n_layers:
+            return None
+
+        if h is None:
+            _, traj = self.forward_with_trajectory(model, x)
+            if layer_idx >= len(traj):
+                return None
+            h = traj[layer_idx]
+
+        ref = next(model.parameters(), None)
+        if ref is not None:
+            # Trajectories are returned on CPU to bound peak memory.
+            h = h.to(device=ref.device, dtype=ref.dtype)
+
         with torch.no_grad():
-            xi = xi_mod(x)
+            xi = xi_mod(h)
 
         # DepthConditioned: set the layer and apply the depth-code shift
         if hasattr(vtheta, "set_active_layer") and hasattr(vtheta, "_shift"):

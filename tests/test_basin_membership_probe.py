@@ -190,18 +190,22 @@ class _IsoDepthConditioned(nn.Module):
 
 
 class _IsoXiModule(nn.Module):
-    """Maps token ids to (B, T, n_ctx, d) context vectors."""
+    """Maps hidden states ``(B, T, d)`` to ``(B, T, n_ctx, d)`` context vectors.
 
-    def __init__(self, vocab_size: int, d: int, n_ctx: int):
+    Matching the real ``MultiXiModule`` signature is the point: an earlier
+    version of this fixture took *token ids* and embedded them, which let the
+    adapter's ``xi_module(x)`` call pass in tests while raising on every real
+    checkpoint. A fixture that mirrors the bug cannot catch it.
+    """
+
+    def __init__(self, d: int, n_ctx: int):
         super().__init__()
-        self.emb = nn.Embedding(vocab_size, d)
         self.proj = nn.Linear(d, n_ctx * d)
         self.n_ctx, self.d = n_ctx, d
 
-    def forward(self, x):
-        B, T = x.shape
-        flat = self.proj(self.emb(x))
-        return flat.view(B, T, self.n_ctx, self.d)
+    def forward(self, h):
+        B, T, _ = h.shape
+        return self.proj(h).view(B, T, self.n_ctx, self.d)
 
 
 class _IsoFockModel(nn.Module):
@@ -210,7 +214,7 @@ class _IsoFockModel(nn.Module):
     def __init__(self, d: int = 8, K: int = 2, n_ctx: int = 2, n_layers: int = 2):
         super().__init__()
         self.V_theta = _IsoDepthConditioned(d, K, n_ctx, n_layers)
-        self.xi_module = _IsoXiModule(24, d, n_ctx)
+        self.xi_module = _IsoXiModule(d, n_ctx)
         self._n_ctx, self._d = n_ctx, d
 
     def forward(self, x):
@@ -231,7 +235,8 @@ class TestIsotropicWellParameters:
         adapter = scaf.FockAdapter()
 
         x = torch.randint(0, 24, (2, 6))
-        wp = adapter.well_parameters(model, 0, x)
+        h = torch.randn(2, 6, 8)
+        wp = adapter.well_parameters(model, 0, x, h=h)
 
         assert wp is not None
         K_total = model.V_theta.bank.banks[0].K * model._n_ctx
@@ -239,6 +244,50 @@ class TestIsotropicWellParameters:
         assert wp["precision_lr"].shape[-1] == 0, (
             "isotropic bank should synthesise a rank-0 low-rank factor"
         )
+
+    def test_wells_follow_the_hidden_state_not_the_tokens(self):
+        """The landscape is a function of ``xi``, and ``xi`` of ``h_ell``.
+
+        Deriving it from the tokens instead would give one landscape for the
+        whole stack, silently scoring every layer against layer 0's wells even
+        where the call happened not to raise.
+        """
+        model = _IsoFockModel(d=8, K=2, n_ctx=2, n_layers=2)
+        adapter = scaf.FockAdapter()
+        x = torch.randint(0, 24, (2, 6))
+
+        h1, h2 = torch.randn(2, 6, 8), torch.randn(2, 6, 8)
+        wp1 = adapter.well_parameters(model, 0, x, h=h1)
+        wp2 = adapter.well_parameters(model, 0, x, h=h2)
+        assert not torch.allclose(wp1["mu"], wp2["mu"]), (
+            "different hidden states must yield different wells"
+        )
+
+        # Same state, different layer: the depth code shifts the landscape.
+        wp_l1 = adapter.well_parameters(model, 1, x, h=h1)
+        assert not torch.allclose(wp1["mu"], wp_l1["mu"])
+
+    def test_wells_are_per_position(self):
+        model = _IsoFockModel(d=8, K=2, n_ctx=2, n_layers=2)
+        wp = scaf.FockAdapter().well_parameters(
+            model, 0, torch.randint(0, 24, (2, 6)), h=torch.randn(2, 6, 8)
+        )
+        assert wp["mu"].shape[:2] == (2, 6), (
+            "context-dependent wells carry a time axis"
+        )
+
+    def test_layer_beyond_the_stack_has_no_landscape(self):
+        """A trajectory holds L+1 states but only L layers have a depth code.
+
+        The depth-conditioned V_theta wraps the index modulo ``n_layers``, so
+        without this guard the final hidden state would be scored against
+        layer 0's wells rather than skipped.
+        """
+        model = _IsoFockModel(d=8, K=2, n_ctx=2, n_layers=2)
+        wp = scaf.FockAdapter().well_parameters(
+            model, 2, torch.randint(0, 24, (2, 6)), h=torch.randn(2, 6, 8)
+        )
+        assert wp is None
 
     def test_assign_dominant_wells_handles_rank_zero_precision(self):
         """A rank-0 precision_lr must contribute exactly zero to the score,
