@@ -51,6 +51,48 @@ _EXCHANGE_MARKERS = ("exchange_force", "exchange_scale")
 _CLAMPABLE_GATES = ("reverse_channel_scale", "exchange_scale")
 
 
+def _has_gaussian_wells(model: nn.Module) -> bool:
+    """Check whether the model's V_theta exposes Gaussian well parameters.
+
+    True for models using ``AnisotropicDepthConditionedGaussianVTheta`` or
+    ``AnisotropicMultiContextGaussianVTheta`` — detected structurally via
+    ``_components`` and ``mu_proj``.  Also true for toy models that expose
+    ``well_parameters`` directly.
+    """
+    vtheta = getattr(model, "V_theta", None)
+    if vtheta is None:
+        return hasattr(model, "well_parameters")
+    # AnisotropicDepthConditioned wraps a bank; the bank wraps per-head banks.
+    bank = getattr(vtheta, "bank", vtheta)
+    if hasattr(bank, "banks"):
+        # AnisotropicMultiContextGaussianVTheta — check the first head
+        heads = bank.banks
+        if hasattr(heads, "__getitem__") and len(heads) > 0:
+            bank = heads[0]
+    return hasattr(bank, "_components") and hasattr(bank, "mu_proj")
+
+
+def _unpack_components(
+    bank: nn.Module, xi: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Call ``bank._components(xi)`` and normalise to a 4-tuple.
+
+    The isotropic Gaussian family (``MixtureGaussianVTheta``) returns
+    ``(mu, a, w)`` — diagonal precision only, no low-rank term. The
+    anisotropic family returns ``(mu, a, w, B)``. A rank-0 ``B`` is
+    synthesised for the isotropic case so callers can treat both
+    uniformly: ``einsum('...kd,...kdr->...kr', diff, B)`` with an
+    empty last dimension contributes exactly zero to the quadratic form,
+    which is precision-mathematically correct (no low-rank correction).
+    """
+    out = bank._components(xi)  # noqa: SLF001
+    if len(out) == 4:
+        return out
+    mu, a, w = out
+    B = mu.new_zeros(*mu.shape, 0)
+    return mu, a, w, B
+
+
 def _first_attr(model: nn.Module, names: Iterable[str]) -> str | None:
     for n in names:
         if getattr(model, n, None) is not None:
@@ -130,6 +172,7 @@ class FockAdapter(ModelAdapter):
             hasattr(model, "_stack_forward")
             or hasattr(model, "forward_with_trajectory")
         )
+        has_wells = _has_gaussian_wells(model)
 
         return Capabilities(
             requires_grad_forward=True,
@@ -138,6 +181,7 @@ class FockAdapter(ModelAdapter):
             has_reverse_channel=has_reverse,
             has_attention=getattr(model, "attn_blocks", None) is not None,
             has_hidden_states=has_trajectory,
+            has_vtheta_wells=has_wells,
             mediators=tuple(mediators),
             causal_flags=flags,
             notes=tuple(notes),
@@ -200,6 +244,78 @@ class FockAdapter(ModelAdapter):
                     param.fill_(value)
                     found = True
         return found
+
+    # ------------------------------------------------------------------
+    def well_parameters(
+        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        """Extract Gaussian well parameters for a given layer.
+
+        Handles three model shapes:
+
+        1. ``model.well_parameters(layer_idx, x)`` — explicit API (toy models).
+        2. ``*DepthConditionedGaussianVTheta`` (isotropic or anisotropic) —
+           sets active layer, derives ``xi`` from ``x``, calls
+           ``bank._components``.
+        3. Returns ``None`` if the model has no Gaussian wells.
+
+        ``_components`` returns a 3-tuple ``(mu, a, w)`` for the isotropic
+        family (``MixtureGaussianVTheta`` — diagonal precision only) and a
+        4-tuple ``(mu, a, w, B)`` for the anisotropic family (adds a
+        low-rank factor). The isotropic case is normalised to a zero-rank
+        ``B`` so :func:`~scaf.probes.basin_membership.assign_dominant_wells`
+        can treat both uniformly: the low-rank quadratic term vanishes and
+        the Mahalanobis distance reduces to the pure diagonal form.
+        """
+        if hasattr(model, "well_parameters"):
+            return model.well_parameters(layer_idx, x)
+
+        vtheta = getattr(model, "V_theta", None)
+        if vtheta is None:
+            return None
+
+        xi_mod = getattr(model, "xi_module", None)
+        if xi_mod is None:
+            return None
+
+        with torch.no_grad():
+            xi = xi_mod(x)
+
+        # DepthConditioned: set the layer and apply the depth-code shift
+        if hasattr(vtheta, "set_active_layer") and hasattr(vtheta, "_shift"):
+            vtheta.set_active_layer(layer_idx)
+            xi_shifted = vtheta._shift(xi)  # noqa: SLF001
+        else:
+            xi_shifted = xi
+
+        # Reach the actual Gaussian bank that has _components
+        bank = getattr(vtheta, "bank", vtheta)
+        if hasattr(bank, "banks"):
+            # MultiContext: extract from each head and concatenate
+            heads = bank.banks
+            all_mu, all_a, all_w, all_B = [], [], [], []
+            for m_idx, head in enumerate(heads):
+                xi_head = xi_shifted[..., m_idx, :]
+                mu, a, w, B = _unpack_components(head, xi_head)
+                all_mu.append(mu)
+                all_a.append(a)
+                all_w.append(w)
+                all_B.append(B)
+            mu = torch.cat(all_mu, dim=-2)
+            a = torch.cat(all_a, dim=-2)
+            w = torch.cat(all_w, dim=-1)
+            B = torch.cat(all_B, dim=-3)
+        elif hasattr(bank, "_components"):
+            mu, a, w, B = _unpack_components(bank, xi_shifted)
+        else:
+            return None
+
+        return {
+            "mu": mu.detach(),
+            "precision_diag": a.detach(),
+            "precision_lr": B.detach(),
+            "weights": w.detach(),
+        }
 
     # ------------------------------------------------------------------
     def forward_with_trajectory(

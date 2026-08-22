@@ -65,6 +65,11 @@ class Capabilities:
     #: Required for Tier A (hidden-state cosine deviation) probes.
     has_hidden_states: bool = False
 
+    #: Whether the adapter can return Gaussian well parameters (centres,
+    #: precision, weights) for each layer. Required for Tier B
+    #: (basin-membership) probes.
+    has_vtheta_wells: bool = False
+
     #: Named intervention points usable as mediators in a knockout (axiom A5),
     #: most-suspect first.
     mediators: tuple[str, ...] = ()
@@ -87,6 +92,8 @@ class Capabilities:
             bits.append("attention")
         if self.has_hidden_states:
             bits.append("hidden-states")
+        if self.has_vtheta_wells:
+            bits.append("vtheta-wells")
         return ", ".join(bits) if bits else "plain"
 
 
@@ -180,6 +187,39 @@ class ModelAdapter(ABC):
             "Set has_hidden_states=True in capabilities and implement this "
             "method to enable geometric probes."
         )
+
+    def well_parameters(
+        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        """Return Gaussian well parameters for a given layer and input batch.
+
+        For models with anisotropic Gaussian :math:`V_\\theta`, the well
+        parameters are **context-dependent** — they are functions of the
+        learned context vectors ``xi``, which in turn depend on the input
+        tokens. This is why the input batch ``x`` is required: the adapter
+        re-derives ``xi`` from ``x`` to extract the well parameters that were
+        active during the original forward pass.
+
+        Returns a dict with detached tensors::
+
+            {
+                'mu':             (B, K, d)     — well centres,
+                'precision_diag': (B, K, d)     — diagonal precision ``a_k``,
+                'precision_lr':   (B, K, d, r)  — low-rank factor ``B_k``,
+                'weights':        (B, K)        — mixture weights,
+            }
+
+        or ``None`` if the model does not have Gaussian wells.
+
+        The full precision matrix is :math:`\\Sigma_k^{-1} = \\mathrm{diag}(a_k) + B_k B_k^\\top`,
+        but it is never materialised — the quadratic form is evaluated via the
+        diagonal + low-rank decomposition for :math:`O(d \\cdot r)` cost.
+
+        Required for Tier B (basin-membership) probes. Adapters that do not
+        support wells leave ``Capabilities.has_vtheta_wells = False`` and
+        probes skip loudly.
+        """
+        return None
 
     @contextlib.contextmanager
     def deterministic(self, model: nn.Module) -> Iterator[None]:

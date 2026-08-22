@@ -34,6 +34,8 @@ __all__ = [
     "DeafToyLM",
     "FockLikeToyLM",
     "TwoChannelLeakToyLM",
+    "GaussianWellCausalToyLM",
+    "GaussianWellLeakyToyLM",
 ]
 
 
@@ -249,3 +251,94 @@ class TwoChannelLeakToyLM(_ToyBase):
             * torch.roll(pool, shifts=1, dims=-1)
         )
         return self.out(self._prefix_mean(h) + leak), None
+
+
+# ======================================================================
+# Tier B toys — models with explicit Gaussian wells
+# ======================================================================
+
+class _GaussianWellMixin:
+    """Provides ``well_parameters`` for toy models with fixed, explicit wells.
+
+    Two well centres are placed at opposite corners of the embedding space
+    so that basin boundaries are deterministic and testable.
+    """
+
+    K: int = 2
+    _rank: int = 1
+
+    def _init_wells(self, d: int) -> None:
+        mu = torch.zeros(self.K, d)
+        mu[0, :d // 2] = 2.0
+        mu[1, d // 2:] = 2.0
+        self._well_mu = nn.Parameter(mu, requires_grad=False)
+
+        a = torch.ones(self.K, d)
+        self._well_a = nn.Parameter(a, requires_grad=False)
+
+        B = torch.zeros(self.K, d, self._rank)
+        self._well_B = nn.Parameter(B, requires_grad=False)
+
+        w = torch.ones(self.K) / self.K
+        self._well_w = nn.Parameter(w, requires_grad=False)
+
+    def well_parameters(self, layer_idx: int, x: torch.Tensor) -> dict:
+        B_sz = x.shape[0]
+        return {
+            "mu": self._well_mu.unsqueeze(0).expand(B_sz, -1, -1),
+            "precision_diag": self._well_a.unsqueeze(0).expand(B_sz, -1, -1),
+            "precision_lr": self._well_B.unsqueeze(0).expand(B_sz, -1, -1, -1),
+            "weights": self._well_w.unsqueeze(0).expand(B_sz, -1),
+        }
+
+
+class GaussianWellCausalToyLM(_GaussianWellMixin, _ToyBase):
+    """Strictly causal model with known Gaussian well parameters.
+
+    Basin assignments are deterministic and invariant to future perturbation,
+    so ``BasinMembershipProbe`` must report ``crossing_rate = 0``.
+    """
+
+    def __init__(self, cfg: ToyConfig | None = None) -> None:
+        _ToyBase.__init__(self, cfg)
+        self._init_wells(self.cfg.d)
+
+    def forward(self, x):
+        h = self.emb(x)
+        return self.out(self._prefix_mean(h)), None
+
+    def forward_with_trajectory(self, x):
+        h = self.emb(x)
+        h_out = self._prefix_mean(h)
+        return self.out(h_out), [h, h_out]
+
+
+class GaussianWellLeakyToyLM(_GaussianWellMixin, _ToyBase):
+    """Leaky model with known Gaussian wells.
+
+    The global-pool leak moves hidden states enough to cross basin
+    boundaries, so ``BasinMembershipProbe`` must report
+    ``crossing_rate > 0``.
+    """
+
+    def __init__(
+        self,
+        cfg: ToyConfig | None = None,
+        leak_scale: float = 4.0,
+    ) -> None:
+        _ToyBase.__init__(self, cfg)
+        self.leak_scale = float(leak_scale)
+        self._init_wells(self.cfg.d)
+
+    def forward(self, x):
+        h = self.emb(x)
+        global_pool = h.mean(dim=1, keepdim=True)
+        return self.out(
+            self._prefix_mean(h) + self.leak_scale * global_pool
+        ), None
+
+    def forward_with_trajectory(self, x):
+        h = self.emb(x)
+        global_pool = h.mean(dim=1, keepdim=True)
+        h_out = self._prefix_mean(h) + self.leak_scale * global_pool
+        return self.out(h_out), [h, h_out]
