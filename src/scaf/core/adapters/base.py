@@ -61,6 +61,10 @@ class Capabilities:
     has_reverse_channel: bool = False
     has_attention: bool = False
 
+    #: Whether the adapter can return per-layer hidden-state trajectories.
+    #: Required for Tier A (hidden-state cosine deviation) probes.
+    has_hidden_states: bool = False
+
     #: Named intervention points usable as mediators in a knockout (axiom A5),
     #: most-suspect first.
     mediators: tuple[str, ...] = ()
@@ -81,6 +85,8 @@ class Capabilities:
             bits.append("reverse-channel")
         if self.has_attention:
             bits.append("attention")
+        if self.has_hidden_states:
+            bits.append("hidden-states")
         return ", ".join(bits) if bits else "plain"
 
 
@@ -155,6 +161,25 @@ class ModelAdapter(ABC):
             out = model(x)
         logits = out[0] if isinstance(out, (tuple, list)) else out
         return logits.detach()
+
+    def forward_with_trajectory(
+        self, model: nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run a forward pass and return ``(logits, [h_0, h_1, ..., h_L])``.
+
+        Each ``h_ℓ`` has shape ``(B, T, d)`` — the hidden state at position
+        ``t`` after layer ``ℓ`` has executed. ``h_0`` is the embedding layer
+        output. ``h_L`` is the final hidden state before the output projection.
+
+        Required for Tier A geometric probes (hidden-state cosine deviation).
+        Adapters that do not support trajectories leave
+        ``Capabilities.has_hidden_states = False`` and probes skip loudly.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support forward_with_trajectory. "
+            "Set has_hidden_states=True in capabilities and implement this "
+            "method to enable geometric probes."
+        )
 
     @contextlib.contextmanager
     def deterministic(self, model: nn.Module) -> Iterator[None]:

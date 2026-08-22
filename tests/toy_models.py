@@ -76,6 +76,11 @@ class CausalToyLM(_ToyBase):
         h = self.emb(x)
         return self.out(self._prefix_mean(h)), None
 
+    def forward_with_trajectory(self, x):
+        h = self.emb(x)
+        h_out = self._prefix_mean(h)
+        return self.out(h_out), [h, h_out]
+
 
 class LeakyToyLM(_ToyBase):
     """Adds a mean over *all* positions — a miniature shared register state.
@@ -92,6 +97,12 @@ class LeakyToyLM(_ToyBase):
         h = self.emb(x)
         global_pool = h.mean(dim=1, keepdim=True)
         return self.out(self._prefix_mean(h) + self.leak_scale * global_pool), None
+
+    def forward_with_trajectory(self, x):
+        h = self.emb(x)
+        global_pool = h.mean(dim=1, keepdim=True)
+        h_out = self._prefix_mean(h) + self.leak_scale * global_pool
+        return self.out(h_out), [h, h_out]
 
 
 class PeekingToyLM(_ToyBase):
@@ -186,11 +197,16 @@ class FockLikeToyLM(LeakyToyLM):
         h = self.emb(x)
         global_pool = h.mean(dim=1, keepdim=True)
         gate = torch.tanh(self.reverse_channel_scale).view(1, 1, 1)
-        # The gate is the leak's sole carrier: closing it must restore exact
-        # causality, which is what the mediation knockout asserts.
         return self.out(
             self._prefix_mean(h) + self.leak_scale * gate * global_pool
         ), None
+
+    def forward_with_trajectory(self, x):
+        h = self.emb(x)
+        global_pool = h.mean(dim=1, keepdim=True)
+        gate = torch.tanh(self.reverse_channel_scale).view(1, 1, 1)
+        h_out = self._prefix_mean(h) + self.leak_scale * gate * global_pool
+        return self.out(h_out), [h, h_out]
 
 
 class TwoChannelLeakToyLM(_ToyBase):

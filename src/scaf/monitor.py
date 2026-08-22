@@ -46,6 +46,7 @@ from .controls import DeterminismControl, PlaceboControl, PositiveControl
 from .core.corpus import Corpus, SyntheticCorpus, TokenCorpus
 from .core.intervenable import InterventableModel
 from .probes.future_perturbation import FuturePerturbationProbe
+from .probes.hidden_state import HiddenStateLeakProbe
 from .probes.target_relocation import TargetRelocationProbe
 from .report import CausalLeakError, LeakScorecard
 
@@ -113,6 +114,11 @@ class LeakMonitor:
         micro_batch: Forward chunk size. Register tensors are ``(B, T, M, d)``
             under the prefix-causal fix, so at ``seq_len=512`` this wants to be
             ``2`` or ``1``.
+        hidden_state_probe: Also run the Tier A hidden-state cosine-deviation
+            probe. Requires the adapter to expose ``has_hidden_states``. When
+            the adapter does not support trajectories, this is silently
+            ignored (the probe skips rather than crashes). Cheap enough for
+            every eval step: uses a single split and a single pair.
         honest_ppl: Also run the target-relocation stage, which reports the
             leak tax in nats and the honest perplexity. This is the stage that
             exposed the original register leak after the perturbation test
@@ -155,6 +161,7 @@ class LeakMonitor:
         splits: tuple[float, ...] = (0.5,),
         n_pairs: int = 1,
         micro_batch: int = 2,
+        hidden_state_probe: bool = True,
         honest_ppl: bool = True,
         honest_ppl_interval: int | None = None,
         n_targets: int = 16,
@@ -178,6 +185,7 @@ class LeakMonitor:
         self.splits = splits
         self.n_pairs = n_pairs
         self.micro_batch = micro_batch
+        self.hidden_state_probe = hidden_state_probe
         self.honest_ppl = honest_ppl
         self.honest_ppl_interval = int(honest_ppl_interval or interval)
         self.n_targets = n_targets
@@ -324,6 +332,20 @@ class LeakMonitor:
                     micro_batch=self.micro_batch,
                 ).run(im, self.corpus)
             ]
+            diagnostics = []
+            if self.hidden_state_probe and im.caps.has_hidden_states:
+                try:
+                    diagnostics.append(
+                        HiddenStateLeakProbe(
+                            splits=self.splits,
+                            n_seqs=self.n_seqs,
+                            n_pairs=self.n_pairs,
+                            threshold=floor,
+                            micro_batch=self.micro_batch,
+                        ).run(im, self.corpus)
+                    )
+                except Exception:  # noqa: BLE001 - geometric probe must not crash the monitor
+                    pass
             if want_honest:
                 probes.append(
                     TargetRelocationProbe(
@@ -341,6 +363,7 @@ class LeakMonitor:
                 device=str(im.device),
                 controls=controls,
                 probes=probes,
+                diagnostics=diagnostics,
                 config=im.config(),
                 notes=(
                     ()
@@ -354,7 +377,13 @@ class LeakMonitor:
             n_forwards = im.n_forwards
 
         self.last_scorecard = card
-        fp, tr = probes[0], (probes[1] if len(probes) > 1 else None)
+        fp = probes[0]
+
+        # Find optional probe results by name.
+        hs = next(
+            (d for d in diagnostics if d.name == "hidden_state_leak"), None
+        )
+        tr = next((p for p in probes if p.name == "target_relocation"), None)
 
         record: dict[str, Any] = {
             "event": "scaf_leak_monitor",
@@ -372,6 +401,13 @@ class LeakMonitor:
             record["placebo"] = controls[1].statistic
             record["positive_control"] = controls[2].statistic
             record["controls_ok"] = card.controls_ok
+        if hs is not None and not hs.skipped:
+            record["max_cos_dev"] = hs.statistic
+            record["peak_layer"] = hs.detail.get("peak_layer")
+            record["per_layer_delta_cos"] = hs.detail.get(
+                "per_layer_delta_cos"
+            )
+            record["latent_leak"] = hs.detail.get("latent_leak", False)
         if tr is not None and not tr.skipped:
             record.update(
                 tau_leak=tr.statistic,
@@ -411,19 +447,33 @@ class LeakMonitor:
         """Human-readable history, for printing at the end of a run."""
         if not self.history:
             return "SCAF LeakMonitor — no measurements yet"
+        has_cos = any(r.get("max_cos_dev") is not None for r in self.history)
+        header = (
+            f"{'step':>9}  {'verdict':<8} {'linf':>11} {'AILE':>11} "
+            f"{'tau_leak':>10}"
+        )
+        if has_cos:
+            header += f" {'cos_dev':>10} {'peak_L':>6}"
         lines = [
             f"SCAF LeakMonitor — {len(self.history)} measurements, "
             f"every {self.interval} steps",
-            f"{'step':>9}  {'verdict':<8} {'linf':>11} {'AILE':>11} "
-            f"{'tau_leak':>10}",
+            header,
         ]
         for r in self.history:
             tau = r.get("tau_leak")
-            lines.append(
+            row = (
                 f"{r['step']:>9}  {r['verdict']:<8} "
                 f"{_fmt(r.get('linf')):>11} {_fmt(r.get('aile')):>11} "
                 f"{_fmt(tau, '{:.4f}'):>10}"
             )
+            if has_cos:
+                cos = r.get("max_cos_dev")
+                pk = r.get("peak_layer")
+                row += (
+                    f" {_fmt(cos):>10}"
+                    f" {(str(pk) if pk is not None else '-'):>6}"
+                )
+            lines.append(row)
         first = self.first_leak_step
         if first is not None:
             lines.append(

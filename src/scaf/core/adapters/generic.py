@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import torch
 from torch import nn
 
 from .base import Capabilities, ModelAdapter
@@ -72,9 +73,12 @@ class GenericAdapter(ModelAdapter):
             "attribution is heuristic because the model family is unknown."
         ]
 
+        has_trajectory = (
+            hasattr(model, "_stack_forward")
+            or hasattr(model, "forward_with_trajectory")
+        )
+
         return Capabilities(
-            # Assume grad is needed. Costs a little memory on models that do not
-            # need it; assuming the opposite would hard-crash the ones that do.
             requires_grad_forward=True,
             supports_float64=True,
             has_registers=getattr(model, "register_embed", None) is not None,
@@ -83,10 +87,23 @@ class GenericAdapter(ModelAdapter):
                 for n in ("reverse_ch", "reverse_channel_scale")
             ),
             has_attention=getattr(model, "attn_blocks", None) is not None,
+            has_hidden_states=has_trajectory,
             mediators=mediators,
             causal_flags=flags,
             notes=tuple(notes),
         )
+
+    def forward_with_trajectory(
+        self, model: nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Delegate to the model's own ``forward_with_trajectory`` if it exists."""
+        if hasattr(model, "forward_with_trajectory"):
+            with torch.enable_grad():
+                out = model.forward_with_trajectory(x)
+            logits = out[0].detach()
+            trajectory = [h.detach() for h in out[1]]
+            return logits, trajectory
+        return super().forward_with_trajectory(model, x)
 
     def intervention_points(
         self, model: nn.Module

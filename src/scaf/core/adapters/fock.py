@@ -126,12 +126,18 @@ class FockAdapter(ModelAdapter):
                     "report it."
                 )
 
+        has_trajectory = (
+            hasattr(model, "_stack_forward")
+            or hasattr(model, "forward_with_trajectory")
+        )
+
         return Capabilities(
             requires_grad_forward=True,
             supports_float64=True,
             has_registers=True,
             has_reverse_channel=has_reverse,
             has_attention=getattr(model, "attn_blocks", None) is not None,
+            has_hidden_states=has_trajectory,
             mediators=tuple(mediators),
             causal_flags=flags,
             notes=tuple(notes),
@@ -194,3 +200,53 @@ class FockAdapter(ModelAdapter):
                     param.fill_(value)
                     found = True
         return found
+
+    # ------------------------------------------------------------------
+    def forward_with_trajectory(
+        self, model: nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return ``(logits, [h_0, ..., h_L])`` using the model's own trajectory support.
+
+        Three paths, in priority order:
+
+        1. ``model.forward_with_trajectory(x)`` — explicit trajectory API
+           (used by toy models in the test suite).
+        2. ``model._embed(x)`` + ``model._stack_forward(h, ..., return_trajectory=True)``
+           — the real Fock-PARFLM internal API.
+        3. Raises ``NotImplementedError`` if neither is available.
+
+        Logits and hidden states are detached so the autograd graph is freed
+        after each pass, matching the contract of ``forward_logits``.
+        """
+        with torch.enable_grad():
+            if hasattr(model, "forward_with_trajectory"):
+                out = model.forward_with_trajectory(x)
+                logits = out[0].detach()
+                trajectory = [h.detach() for h in out[1]]
+                return logits, trajectory
+
+            if hasattr(model, "_stack_forward") and hasattr(model, "_embed"):
+                h = model._embed(x)
+                sf_out = model._stack_forward(h, return_trajectory=True)
+                # _stack_forward returns (h_final, trajectory) or
+                # (h_final, loss, trajectory) depending on the version.
+                if isinstance(sf_out[-1], (list, tuple)):
+                    traj_raw = sf_out[-1]
+                else:
+                    traj_raw = [sf_out[0]]
+                logits_in = traj_raw[-1] if traj_raw else sf_out[0]
+                score_head = getattr(model, "score_head", None)
+                if score_head is not None:
+                    logits = score_head(logits_in).detach()
+                else:
+                    logits = model(x)
+                    logits = (logits[0] if isinstance(logits, (tuple, list))
+                              else logits).detach()
+                trajectory = [h.detach() for h in traj_raw]
+                return logits, trajectory
+
+        raise NotImplementedError(
+            "FockAdapter.forward_with_trajectory: model has neither "
+            "'forward_with_trajectory' nor '_embed'+'_stack_forward'. "
+            "Cannot extract hidden-state trajectories."
+        )
