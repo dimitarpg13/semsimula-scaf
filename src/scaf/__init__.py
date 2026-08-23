@@ -45,7 +45,7 @@ from .core.adapters import (
     resolve_adapter,
 )
 from .core.corpus import Corpus, SyntheticCorpus, TokenCorpus
-from .core.intervenable import InterventableModel
+from .core.intervenable import InertIntervention, InterventableModel
 from .estimate.frames import LeakFrame, build_leak_frame
 from .estimate.pywhy import EstimationReport, RefutationResult, estimate_leak
 from .monitor import LeakMonitor
@@ -63,6 +63,7 @@ __all__ = [
     "__version__",
     "audit",
     # core
+    "InertIntervention",
     "InterventableModel",
     "Corpus",
     "TokenCorpus",

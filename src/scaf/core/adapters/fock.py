@@ -18,6 +18,7 @@ whether or not the research repo is on ``sys.path``.
 from __future__ import annotations
 
 import contextlib
+import inspect
 from collections.abc import Iterable, Iterator
 
 import torch
@@ -49,6 +50,39 @@ _EXCHANGE_MARKERS = ("exchange_force", "exchange_scale")
 #: routing gate, and zeroing it would distort every logit rather than isolate
 #: a path.
 _CLAMPABLE_GATES = ("reverse_channel_scale", "exchange_scale")
+
+#: Entry points that the layer step calls *directly*, bypassing ``__call__``
+#: and therefore every forward hook. Which one runs is a config decision:
+#: ``V_phi.forward_gathered`` under ``use_gathered_v_phi``,
+#: ``creation_gate_qkv.forward_prefix`` under ``prefix_causal_registers``,
+#: ``V_theta.analytical_grad`` when the closed-form force is used (always, for
+#: a structured V_theta in the single-xi stack; flag- or integrator-gated in
+#: the multi-xi stack). All three are the *production* settings, so hooking
+#: only ``__call__`` left these modules advertised as intervenable but inert.
+#: Declaring a method that never runs costs nothing — the wrapper simply does
+#: not fire — so the table is deliberately config-independent and the runtime
+#: fired-check in ``InterventableModel.do`` decides what actually happened.
+_BYPASS_METHODS = {
+    "V_theta": ("analytical_grad",),
+    "V_phi": ("forward_gathered",),
+    "creation_gate_qkv": ("forward_prefix",),
+}
+
+
+def _accepts(fn, param: str) -> bool:
+    """Whether callable ``fn`` takes a parameter named ``param``.
+
+    Used to gate capabilities on the *actual* signature rather than on the
+    mere presence of an attribute. ``has_hidden_states=True`` for a model
+    whose ``_stack_forward`` cannot return a trajectory is worse than False:
+    the probe runs and dies with a TypeError instead of skipping loudly.
+    """
+    if not callable(fn):
+        return False
+    try:
+        return param in inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # builtins, C extensions
+        return False
 
 
 def _has_gaussian_wells(model: nn.Module) -> bool:
@@ -146,6 +180,13 @@ class FockAdapter(ModelAdapter):
                 "causal_force", "prefix_causal_registers", "reverse_channel",
                 "n_registers", "stack_discipline", "fock_version",
                 "xi_channels", "top_k",
+                # The integrator is part of the model's causal identity: it
+                # decides which entry points run (analytic force vs autograd),
+                # what the layer state is (h alone vs (h, v)), and whether the
+                # forward is stochastic. A verdict recorded without it cannot
+                # say which dynamical system it certified.
+                "integrator", "vtheta_analytic_force", "langevin_T",
+                "langevin_noise_eval",
             ):
                 if hasattr(cfg, key):
                     flags[key] = getattr(cfg, key)
@@ -168,9 +209,30 @@ class FockAdapter(ModelAdapter):
                     "report it."
                 )
 
+            integrator = getattr(cfg, "integrator", "verlet")
+            if integrator != "verlet":
+                notes.append(
+                    f"integrator={integrator!r}: the layer state is the pair "
+                    "(h, v), not h alone. Causal reachability is unchanged — "
+                    "the propagator is a per-position map — but a hidden-state "
+                    "trajectory reports positions only, so a leak carried "
+                    "purely in the velocity would show up one layer late."
+                )
+            if getattr(cfg, "langevin_T", 0.0):
+                notes.append(
+                    f"langevin_T={cfg.langevin_T}: the thermostat injects "
+                    "noise into the forward pass. deterministic() disables it "
+                    "at eval; a verdict measured with it live would be noise, "
+                    "not leakage."
+                )
+
         has_trajectory = (
-            hasattr(model, "_stack_forward")
-            or hasattr(model, "forward_with_trajectory")
+            hasattr(model, "forward_with_trajectory")
+            or (
+                hasattr(model, "_embed")
+                and _accepts(getattr(model, "_stack_forward", None),
+                             "return_trajectory")
+            )
         )
         has_wells = _has_gaussian_wells(model)
 
@@ -190,18 +252,28 @@ class FockAdapter(ModelAdapter):
     # ------------------------------------------------------------------
     @contextlib.contextmanager
     def deterministic(self, model: nn.Module) -> Iterator[None]:
-        """Freeze routing stochasticity on top of the base eval-mode switch."""
+        """Freeze forward-pass stochasticity on top of the base eval switch.
+
+        Two independent sources: Gumbel routing noise, and the Langevin
+        thermostat of the BAOAB integrator family. The thermostat is the
+        newer one and is off at eval by default, but a run that set
+        ``langevin_noise_eval`` would otherwise make every probe measure
+        thermal noise and read it as leakage.
+        """
         was_training = model.training
         cfg = getattr(model, "cfg", None)
-        prev_noise = getattr(cfg, "gumbel_noise", None) if cfg else None
+        saved: dict[str, object] = {}
         model.eval()
-        if cfg is not None and prev_noise is not None:
-            cfg.gumbel_noise = False
+        if cfg is not None:
+            for flag in ("gumbel_noise", "langevin_noise_eval"):
+                if getattr(cfg, flag, None) is not None:
+                    saved[flag] = getattr(cfg, flag)
+                    setattr(cfg, flag, False)
         try:
             yield
         finally:
-            if cfg is not None and prev_noise is not None:
-                cfg.gumbel_noise = prev_noise
+            for flag, value in saved.items():
+                setattr(cfg, flag, value)
             model.train(was_training)
 
     # ------------------------------------------------------------------
@@ -218,6 +290,19 @@ class FockAdapter(ModelAdapter):
             if isinstance(mod, nn.Module):
                 points.append((attr, mod))
         return points
+
+    def intervention_methods(
+        self, model: nn.Module
+    ) -> Iterable[tuple[str, nn.Module, str]]:
+        methods: list[tuple[str, nn.Module, str]] = []
+        for attr, method_names in _BYPASS_METHODS.items():
+            mod = getattr(model, attr, None)
+            if not isinstance(mod, nn.Module):
+                continue
+            for method_name in method_names:
+                if callable(getattr(mod, method_name, None)):
+                    methods.append((attr, mod, method_name))
+        return methods
 
     def parameter_interventions(
         self, model: nn.Module
@@ -247,7 +332,11 @@ class FockAdapter(ModelAdapter):
 
     # ------------------------------------------------------------------
     def well_parameters(
-        self, model: nn.Module, layer_idx: int, x: torch.Tensor
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor] | None:
         """Extract Gaussian well parameters for a given layer.
 
@@ -255,9 +344,14 @@ class FockAdapter(ModelAdapter):
 
         1. ``model.well_parameters(layer_idx, x)`` — explicit API (toy models).
         2. ``*DepthConditionedGaussianVTheta`` (isotropic or anisotropic) —
-           sets active layer, derives ``xi`` from ``x``, calls
-           ``bank._components``.
+           sets active layer, derives ``xi`` from the layer's hidden state,
+           calls ``bank._components``.
         3. Returns ``None`` if the model has no Gaussian wells.
+
+        The layer step computes ``xis = xi_module(h_ell)`` from the *hidden
+        state*, so ``xi_module`` takes ``(B, T, d)`` activations. Passing it
+        the ``(B, T)`` token batch instead raises inside the module, which is
+        what made Tier B unusable on every real multi-xi checkpoint.
 
         ``_components`` returns a 3-tuple ``(mu, a, w)`` for the isotropic
         family (``MixtureGaussianVTheta`` — diagonal precision only) and a
@@ -268,6 +362,8 @@ class FockAdapter(ModelAdapter):
         the Mahalanobis distance reduces to the pure diagonal form.
         """
         if hasattr(model, "well_parameters"):
+            if _accepts(model.well_parameters, "h"):
+                return model.well_parameters(layer_idx, x, h=h)
             return model.well_parameters(layer_idx, x)
 
         vtheta = getattr(model, "V_theta", None)
@@ -278,8 +374,27 @@ class FockAdapter(ModelAdapter):
         if xi_mod is None:
             return None
 
+        # A trajectory carries L+1 states but the depth code has L entries, so
+        # the final hidden state addresses no layer. The depth-conditioned
+        # V_theta wraps out-of-range indices modulo n_layers, which would
+        # silently hand back layer 0's landscape instead of saying "none".
+        n_layers = getattr(vtheta, "n_layers", None)
+        if n_layers is not None and not 0 <= layer_idx < n_layers:
+            return None
+
+        if h is None:
+            _, traj = self.forward_with_trajectory(model, x)
+            if layer_idx >= len(traj):
+                return None
+            h = traj[layer_idx]
+
+        ref = next(model.parameters(), None)
+        if ref is not None:
+            # Trajectories are returned on CPU to bound peak memory.
+            h = h.to(device=ref.device, dtype=ref.dtype)
+
         with torch.no_grad():
-            xi = xi_mod(x)
+            xi = xi_mod(h)
 
         # DepthConditioned: set the layer and apply the depth-code shift
         if hasattr(vtheta, "set_active_layer") and hasattr(vtheta, "_shift"):
@@ -331,6 +446,15 @@ class FockAdapter(ModelAdapter):
            — the real Fock-PARFLM internal API.
         3. Raises ``NotImplementedError`` if neither is available.
 
+        The internal path takes ``x`` as well as the embedding: the stack
+        needs the tokens to derive the per-token mass and the register
+        lifecycle, so the signature is ``_stack_forward(h0, x, ...)``.
+
+        Logits come from the model's output head (``compute_logits``), never
+        from ``score_head`` — in this family ``score_head`` is the *pair*
+        score ``pi(h_i, h_j)`` used to select V_phi neighbours, so feeding it
+        a hidden state and calling the result logits is a category error.
+
         Logits and hidden states are detached so the autograd graph is freed
         after each pass, matching the contract of ``forward_logits``.
         """
@@ -341,28 +465,31 @@ class FockAdapter(ModelAdapter):
                 trajectory = [h.detach() for h in out[1]]
                 return logits, trajectory
 
-            if hasattr(model, "_stack_forward") and hasattr(model, "_embed"):
+            stack_forward = getattr(model, "_stack_forward", None)
+            if hasattr(model, "_embed") and _accepts(
+                stack_forward, "return_trajectory"
+            ):
                 h = model._embed(x)
-                sf_out = model._stack_forward(h, return_trajectory=True)
+                args = (h, x) if _accepts(stack_forward, "x") else (h,)
+                sf_out = stack_forward(*args, return_trajectory=True)
                 # _stack_forward returns (h_final, trajectory) or
                 # (h_final, loss, trajectory) depending on the version.
                 if isinstance(sf_out[-1], (list, tuple)):
                     traj_raw = sf_out[-1]
                 else:
                     traj_raw = [sf_out[0]]
-                logits_in = traj_raw[-1] if traj_raw else sf_out[0]
-                score_head = getattr(model, "score_head", None)
-                if score_head is not None:
-                    logits = score_head(logits_in).detach()
+                if hasattr(model, "compute_logits"):
+                    logits = model.compute_logits(sf_out[0]).detach()
                 else:
-                    logits = model(x)
-                    logits = (logits[0] if isinstance(logits, (tuple, list))
-                              else logits).detach()
+                    out = model(x)
+                    logits = (out[0] if isinstance(out, (tuple, list))
+                              else out).detach()
                 trajectory = [h.detach() for h in traj_raw]
                 return logits, trajectory
 
         raise NotImplementedError(
             "FockAdapter.forward_with_trajectory: model has neither "
-            "'forward_with_trajectory' nor '_embed'+'_stack_forward'. "
-            "Cannot extract hidden-state trajectories."
+            "'forward_with_trajectory' nor '_embed' plus a '_stack_forward' "
+            "that accepts return_trajectory. Cannot extract hidden-state "
+            "trajectories."
         )

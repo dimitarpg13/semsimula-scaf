@@ -82,8 +82,24 @@ def _cosine_deviation(h_a: torch.Tensor, h_b: torch.Tensor) -> torch.Tensor:
     """Compute ``1 - cos(h_a, h_b)`` along the last dimension.
 
     Returns a tensor of the same leading shape as ``h_a[:, :, ...]``.
+
+    Bit-identical inputs are forced to exactly zero. A cosine is a ratio of
+    two separately-accumulated reductions, so ``cos(h, h)`` comes back as
+    ``1 ± eps`` rather than exactly 1 — around ``2e-7`` in float32 for a
+    few hundred dimensions. The probe's threshold is an exact zero, because
+    a causal model must produce bit-identical past states, so that residue
+    alone would fail every model ever tested, clean ones included. Masking it
+    keeps the exact-zero threshold meaningful: a position whose two hidden
+    states agree bit-for-bit has, by definition, not deviated.
+
+    Near-identical states are clamped at zero for the same reason: the same
+    rounding puts ``cos`` marginally above 1, and a *negative* deviation is
+    not a physical quantity — it is noise with a sign, which a downstream
+    CATE regression would happily fit.
     """
-    return 1.0 - F.cosine_similarity(h_a, h_b, dim=-1)
+    dev = 1.0 - F.cosine_similarity(h_a, h_b, dim=-1)
+    dev = dev.masked_fill((h_a == h_b).all(dim=-1), 0.0)
+    return dev.clamp_min(0.0)
 
 
 def measure_hidden_state_influence(
