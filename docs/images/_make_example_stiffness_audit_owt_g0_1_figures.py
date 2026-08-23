@@ -47,6 +47,17 @@ where the run was manually stopped), so the ONE trigger
 (`val_ppl < best_val_ppl`) that would have produced a `_best.pt` save
 inside that window simply never fired.
 
+Figure 5: the REAL Phase 7c (native=True) cross-check against the same
+four checkpoints -- Weyl-bound `max`/`frac(>2)` under the forced
+`baoab_cfc` trajectory (Phase 7b, Figure 3) side by side with the same
+statistic measured along each checkpoint's own, unmodified Verlet
+trajectory. This settles the trajectory-substitution caveat raised
+alongside Figure 3: `frac(>2)` agrees to within 0.006 percentage points
+at every checkpoint, ~150x smaller than the 0.924-point trend across the
+run, while `max` (a single most-extreme sampled position) moves more
+between modes, as expected for a statistic that individual trajectory
+divergence is free to affect.
+
 Run: python3 _make_example_stiffness_audit_owt_g0_1_figures.py
 """
 import numpy as np
@@ -266,3 +277,50 @@ fig4.tight_layout()
 out4 = "scaf_example_owt_g0_1_best_ppl_frozen_no_checkpoint_gap.png"
 fig4.savefig(out4, dpi=150)
 print(f"Saved: {out4}")
+
+# ── Figure 5: REAL Phase 7c (native=True) cross-check -- Weyl bound,
+#    forced (baoab_cfc) vs. native (Verlet) trajectory, same four
+#    checkpoints. Copied verbatim from the notebook's printed output ──
+NATIVE_WEYL_MAX = [3.0195, 4.0838, 2.7457, 3.1421]
+NATIVE_WEYL_FRAC = [5.276e-02, 5.621e-02, 5.932e-02, 6.204e-02]
+
+fig5, (ax6, ax7) = plt.subplots(
+    2, 1, figsize=(9.5, 7.5), sharex=True,
+    gridspec_kw={"height_ratios": [1.2, 1]},
+)
+ax6.plot(STEPS, EIG_WEYL_MAX, "o-", ms=6.5, lw=1.6, color="#3498db",
+         label="Weyl max, forced baoab_cfc trajectory (Phase 7b)")
+ax6.plot(STEPS, NATIVE_WEYL_MAX, "^--", ms=7.5, lw=1.6, color="#8e44ad",
+         label="Weyl max, native Verlet trajectory (Phase 7c)")
+ax6.axhline(y=2.0, color="black", linewidth=1.6, linestyle=":",
+            label="Verlet stability bound, omega dt = 2")
+for i, r in enumerate(WATCHDOG_RELOAD_STEPS):
+    ax6.axvline(x=r, color="#95a5a6", linewidth=1.0, alpha=0.6,
+                label="watchdog reload (real)" if i == 0 else None)
+ax6.set_ylabel("omega * dt (Weyl bound, max)")
+ax6.set_title(
+    "REAL Phase 7c cross-check -- OWT gamma=0.10, anisotropic Gaussian\n"
+    "Weyl bound: forced trajectory vs. this checkpoint's own native Verlet trajectory"
+)
+ax6.legend(loc="upper left", fontsize=8.5)
+ax6.grid(alpha=0.25)
+
+ax7.plot(STEPS, [f * 100 for f in EIG_WEYL_FRAC], "o-", ms=6.5, lw=1.6,
+         color="#3498db", label="frac(omega*dt>2), forced")
+ax7.plot(STEPS, [f * 100 for f in NATIVE_WEYL_FRAC], "^--", ms=7.5, lw=1.6,
+         color="#8e44ad", label="frac(omega*dt>2), native")
+for r in WATCHDOG_RELOAD_STEPS:
+    ax7.axvline(x=r, color="#95a5a6", linewidth=1.0, alpha=0.6)
+ax7.annotate(
+    "agree to within 0.006pp at every step\n"
+    "(~150x smaller than the 0.92pp trend)",
+    xy=(11500, 5.5), ha="center", fontsize=8.5, color="#27ae60")
+ax7.set_xlabel("Training step")
+ax7.set_ylabel("% of sampled (token, layer) positions\nwith omega*dt > 2")
+ax7.grid(alpha=0.25)
+ax7.legend(loc="upper left", fontsize=8.5)
+
+fig5.tight_layout()
+out5 = "scaf_example_owt_g0_1_phase7c_native_vs_forced.png"
+fig5.savefig(out5, dpi=150)
+print(f"Saved: {out5}")

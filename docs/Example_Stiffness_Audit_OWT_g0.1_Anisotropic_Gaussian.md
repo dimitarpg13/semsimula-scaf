@@ -1,13 +1,13 @@
 # Example Stiffness Audit: OWT, γ=0.10, Anisotropic Gaussian, Verlet-Trained
 
-**Status:** worked example against a real run. §3 and §8 are both real
-measurements from this checkpoint's own weights (Phase 7 and Phase 7b
-respectively, both in the default forced-trajectory mode); §6 verifies the
-Weyl-bound inequality against synthetic data, not this checkpoint. Phase
-7c (§3.2, the native-trajectory cross-check) and the exact-eigenvalue
-check (§8.2, §11) have been implemented / designed but not yet run against
-this checkpoint's own weights — this document says exactly which is which
-throughout.
+**Status:** worked example against a real run. §3, §8, and now §3.2/§8.2's
+Phase 7c cross-check are all real measurements from this checkpoint's own
+weights; §6 verifies the Weyl-bound inequality against synthetic data, not
+this checkpoint. Phase 7c's real result (§3.2, §8.2) closes the
+trajectory-substitution caveat for this checkpoint set: the forced- and
+native-trajectory numbers agree to within noise. The exact-eigenvalue
+check (§8.2, §11) remains implemented / designed but not yet run — this
+document says exactly which is which throughout.
 
 **Companion:**
 [`docs/Stiffness_Audit_Requirements_and_Design.md`](Stiffness_Audit_Requirements_and_Design.md)
@@ -114,18 +114,31 @@ derivation in
 [`Stiffness_Audit_Requirements_and_Design.md`](Stiffness_Audit_Requirements_and_Design.md)
 §4.4.
 
-A `native=True` mode now exists specifically to close this gap: it leaves
+A `native=True` mode exists specifically to close this gap: it leaves
 `cfg.integrator` untouched and instead hooks `_layer_forces` to sample
 `harmonic_terms()` at the real `(h, xis)` the checkpoint's own Verlet step
 is evaluating a force at, so `h_new` stays bit-identical to an unhooked
-forward pass. It has not yet been run against this run's own four
-checkpoints — that is Phase 7c in the notebook, and it is an open
-follow-up (§11), not a result folded into §3's table. Given how far below
-the bound §3's numbers already sit (`max=0.632` against a threshold of
-`2.0`), the forced-trajectory bias is unlikely to flip the "not
-curvature-limited" verdict for this specific run, but the table above
-should be read as measured on a numerically-safe stand-in trajectory, not
-on the trajectory this checkpoint's own Verlet inference actually produces.
+forward pass. **It has now been run against this run's own four
+checkpoints (Phase 7c):**
+
+| step | diag max, forced | diag max, native | diag frac(>2), forced | diag frac(>2), native |
+| --- | --- | --- | --- | --- |
+| 9000 | 0.6319 | 0.4520 | 0.000e+00 | 0.000e+00 |
+| 9500 | 0.3423 | 0.6376 | 0.000e+00 | 0.000e+00 |
+| 10000 | 0.4711 | 0.3931 | 0.000e+00 | 0.000e+00 |
+| 15000 | 0.4182 | 0.4868 | 0.000e+00 | 0.000e+00 |
+
+`diag max` moves by a similar amount in either direction under the native
+trajectory (sometimes lower, sometimes higher than forced) — expected,
+since `max` is a single most-extreme sampled position and individual
+positions are exactly what a different integrator's later-layer states
+are free to disagree on. `frac(>2)` stays at exactly `0` in both modes at
+every checkpoint, so the "not curvature-limited along the axes" verdict
+from §3.1 is confirmed to survive the trajectory swap, not just assumed
+to. The far more informative version of this same cross-check is on the
+Weyl-bound statistic, in §8.2 below, where the aggregate `frac(>2)` is
+nonzero and the trajectory-fidelity question actually has something to
+settle.
 
 ---
 
@@ -387,8 +400,9 @@ run genuinely crossed the Verlet stability line via the rotated direction,
 not a measurement of it. The true fraction could be much smaller than
 `5`-`6%` — potentially close to `0`, if the gap for this specific
 `rank=4`, `d=384` model runs as large relative to typical eigenvalues as it
-did in the `rank=4`, `d=16` synthetic check. Two further checks would
-resolve this, both flagged as open follow-ups (§11):
+did in the `rank=4`, `d=16` synthetic check. **This is now the one
+remaining open question** (§11) — the trajectory-fidelity question that
+used to sit alongside it is resolved next.
 
 - **The exact top eigenvalue**, not the additive Weyl bound, computed
   directly from this checkpoint's own per-token effective matrix
@@ -396,17 +410,44 @@ resolve this, both flagged as open follow-ups (§11):
   the small, explicitly-formed `(d, d)` matrix — expensive next to the
   diagonal or Weyl statistics, but not next to a full forward pass, since
   it only needs to run per sampled `(batch, token, layer)` position, not
-  per training step).
-- **The native-trajectory cross-check (Phase 7c, §3.2)**, since these
-  numbers — like §3's — were measured with `cfg.integrator` forced to
-  `'baoab_cfc'` for the duration of the probe, at hidden states this
-  checkpoint's own Verlet training does not actually visit past layer 0.
-  Because CfC's own harmonic sub-step is specifically designed not to
-  develop the excursions that would make Verlet unsafe, the forced
-  trajectory is if anything biased toward showing *less* off-axis
-  curvature than the checkpoint's real Verlet trajectory would, not more
-  — so the true `Weyl frac(>2)` under the native trajectory could be
-  higher than what is reported here, not lower.
+  per training step) is still needed to know how much of the flagged
+  `5`-`6%` survives once the bound's known looseness is removed.
+
+### 8.3 Native-trajectory cross-check: real result (Phase 7c)
+
+§3.2 raised the concern directly: these numbers were measured with
+`cfg.integrator` forced to `'baoab_cfc'` for the duration of the probe, at
+hidden states this checkpoint's own Verlet training does not actually
+visit past layer 0. Phase 7c (`native=True`) has now been run against
+this run's own four checkpoints to settle it:
+
+| step | Weyl max, forced | Weyl max, native | Weyl frac(>2), forced | Weyl frac(>2), native |
+| --- | --- | --- | --- | --- |
+| 9000 | 4.2452 | 3.0195 | 5.282e-02 | 5.276e-02 |
+| 9500 | 2.7128 | 4.0838 | 5.619e-02 | 5.621e-02 |
+| 10000 | 2.9264 | 2.7457 | 5.932e-02 | 5.932e-02 |
+| 15000 | 2.6572 | 3.1421 | 6.206e-02 | 6.204e-02 |
+
+<p align="center"><img src="images/scaf_example_owt_g0_1_phase7c_native_vs_forced.png" alt="A two panel chart sharing the training step x axis. The top panel plots the Weyl bound max against training step for the same four checkpoints under two modes, a blue curve for the forced baoab_cfc trajectory and a purple dashed curve for the native Verlet trajectory, both zig-zagging between about 2.6 and 4.3 with no consistent separation, well above a dotted horizontal line at 2 marking the Verlet stability bound. The bottom panel plots the percentage of sampled positions with omega times delta t exceeding 2 under the Weyl bound for both modes, showing two nearly indistinguishable curves climbing together from about 5.28 percent to about 6.2 percent across the four steps, with the forced and native curves overlapping almost exactly at every point." width="820"></p>
+
+**`Weyl frac(>2)` — the aggregate statistic behind §8's monotonic trend —
+agrees with itself to within `0.006` percentage points at every single
+checkpoint**, against a total `9000`-to-`15000` drift of `0.924`
+percentage points: the forced-vs-native discrepancy is roughly **150x
+smaller** than the trend it is being asked to corroborate or refute.
+`Weyl max` — like `diag max` in §3.2 — moves more between modes (sometimes
+up, sometimes down), because it is a single most-extreme sampled position
+and individual positions are exactly what a substituted trajectory is
+free to disagree on past layer 0; the aggregate statistic is not.
+
+**This closes the trajectory-substitution caveat for this checkpoint
+set.** The monotonic `5.28% -> 5.62% -> 5.93% -> 6.21%` climb in §8.1 is
+not an artifact of measuring the wrong integrator's trajectory — it
+reproduces under the checkpoint's own real Verlet dynamics almost exactly.
+It does **not** address §8.2's separate, still-open question: how much of
+that `5`-`6%` band survives once the Weyl bound's own looseness (not the
+trajectory it was measured on) is replaced by the exact top eigenvalue.
+Those are independent questions, and only one of them is answered here.
 
 ---
 
@@ -499,10 +540,8 @@ recovered from one.
 - Phase 7's real measurements at four checkpoints of this OWT
   `gamma_train=0.10` Verlet run show no axis-aligned Verlet instability:
   `max(omega*dt)` never exceeds `0.632`, `frac(omega*dt>2)=0` everywhere.
-  These numbers come from Phase 7's default forced-trajectory mode (§3.2);
-  Phase 7c's native-trajectory cross-check has not yet been run against
-  this checkpoint set to confirm the forced substitution did not
-  materially change them.
+  Phase 7c's native-trajectory cross-check (§3.2) confirms this survives
+  the forced-vs-native trajectory swap.
 - That result is only a certificate along coordinate axes. The anisotropic
   Gaussian family's low-rank correction is specifically the mechanism that
   can hide curvature off-axis, and it is verified (§6, synthetically) that
@@ -513,12 +552,17 @@ recovered from one.
   stability line at **every** audited checkpoint (`eig_max` from `2.66` to
   `4.25`), with `5.3%`-`6.2%` of sampled `(token, layer)` positions flagged
   — a fraction that climbs steadily across the run — while the diagonal
-  proxy reports exactly `0%` throughout. This is not yet a confirmed
-  instability, because the Weyl bound is provably conservative and §6's
-  own synthetic check showed it can overshoot the true top eigenvalue by
-  an amount comparable to the eigenvalue itself; §8.2 lays out the two
-  follow-ups (exact eigenvalue, native trajectory) needed to know how much
-  of the flagged `5`-`6%` is real.
+  proxy reports exactly `0%` throughout.
+- **Phase 7c has now been run against this same Weyl-bound statistic too
+  (§8.3), and it closes the trajectory-substitution question decisively.**
+  `Weyl frac(>2)` under the checkpoint's own native Verlet trajectory
+  agrees with the forced-trajectory number to within `0.006` percentage
+  points at every checkpoint — about 150x smaller than the `0.924`-point
+  climb across the run. The monotonic trend is not an artifact of
+  measuring the wrong integrator's trajectory. What remains open is
+  §8.2's separate question: how much of the flagged `5`-`6%` survives once
+  the Weyl bound's own conservativeness (not its trajectory) is replaced
+  by the exact top eigenvalue.
 - The `val_ppl` trajectory backslides right in the unaudited gap between
   step 10000 and step 15000, and the full-resolution log (§9) shows
   `best_ppl` frozen at its step-10000 value for the rest of the logged run
@@ -548,13 +592,14 @@ recovered from one.
   the design doc's original open questions anticipated for exactly this
   situation — the Weyl bound flagging a large, non-trivial fraction
   everywhere rather than staying quiet or spiking only near the reload
-  cluster.
-- **Run Phase 7c (`native=True`) against this run's own checkpoints** and
-  update §3.2 and §8.2 with the real gap between the forced and native
-  trajectories for this checkpoint set — now higher priority than before,
-  since §8's result is no longer "comfortably safe either way" but a
-  borderline signal that the forced-vs-native trajectory choice could
-  plausibly move in either direction.
+  cluster. **This is now the sole remaining open question about the
+  `5`-`6%` figure** — the trajectory-fidelity question below it has been
+  answered.
+- ~~Run Phase 7c (`native=True`) against this run's own checkpoints~~ —
+  **done (§3.2, §8.3):** `Weyl frac(>2)` agrees between forced and native
+  trajectories to within `0.006` percentage points at every checkpoint,
+  against a `0.924`-point trend across the run. The trajectory-substitution
+  caveat is closed for this checkpoint set.
 - ~~Extend the checkpoint list into the unaudited gap (`10000`-`15000`)~~
   — not possible for this run: §9 shows no checkpoint was ever saved
   there, because `best_ppl` never improved past its step-`10000` value
