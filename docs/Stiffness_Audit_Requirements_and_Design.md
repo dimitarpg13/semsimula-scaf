@@ -1,9 +1,13 @@
 # Stiffness Audit for Fock-PARFLM Checkpoints: Requirements, Parameters, and a SCAF Migration Design
 
-**Status:** design document. The statistic described here runs today as
-notebook-only cells in `scaf_checkpoint_analysis.ipynb`; nothing in this
-document is implemented inside `src/scaf/` yet. See §9 for why, and §10 for
-what migrating it would look like.
+**Status:** the pure statistic (§10) has migrated into `src/scaf/` as
+`scaf.StiffnessProbe`, on the `stiffness_audit` branch. `scaf_checkpoint_analysis.ipynb`
+still runs its own notebook-only `_stiffness_report` for real checkpoints —
+rewiring its call sites to `StiffnessProbe` is a follow-up, tracked in §12 —
+but the statistic itself is now implemented, unit tested against toy models,
+and no longer duplicated notebook logic once that follow-up lands. See §9 for
+the original reasoning about splitting the notebook and library concerns,
+and §10 for what actually shipped.
 
 **Companion:**
 [`notebooks/conservative_arch/scaleup/debug/scaf_checkpoint_analysis.ipynb`](https://github.com/dimitarpg13/semsimula-paper/blob/main/notebooks/conservative_arch/scaleup/debug/scaf_checkpoint_analysis.ipynb)
@@ -617,12 +621,16 @@ Two comparisons this enables that a gradient-norm log alone cannot:
 
 ## 8. Illustrative example
 
-The figure below is a **schematic**, not measured data — the stiffness
-audit has not yet been run against the OWT `gamma_train=0.10` checkpoints it
+The figure below is a **schematic**, not measured data — it predates the
+audit actually being run against the OWT `gamma_train=0.10` checkpoints it
 illustrates. Only the vertical grey lines are real: they are the exact 15
 `watchdog_reload` steps pulled from that run's `training_log.jsonl`. The blue
 and red curves are synthetic, shaped only to look like what a run with that
-reload pattern would plausibly produce.
+reload pattern would plausibly produce. The audit has since been run for
+real against four checkpoints from this same run, including the Weyl-bound
+extension (§6) and a native-trajectory cross-check (§4.4); see
+[`Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md`](Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md)
+for the real numbers and figures.
 
 <p align="center"><img src="images/scaf_stiffness_omega_dt_trend_schematic.png" alt="A schematic line chart titled omega dt versus step. The x axis is training step from 0 to about 17500 and the y axis is omega times delta t from 0 to about 6.5. A blue curve labeled p99 schematic and a red dashed curve labeled max schematic both rise gradually from below 1 early in training to several times higher later, with small bumps superimposed. A black dotted horizontal line at height 2 is labeled Verlet stability bound. Fifteen thin vertical grey lines mark real watchdog reload steps from the actual gamma equals 0.10 run, clustering more densely as the curves rise, visually suggesting that reload frequency tracks the stiffness statistic." width="820"></p>
 
@@ -654,19 +662,19 @@ is still moving.
 
 ---
 
-## 10. Migration plan: what moves, what stays
+## 10. Migration: what moved, what stays (done)
 
 The split is not new — it is exactly how Tier A and Tier B already work.
 `HiddenStateLeakProbe` and `BasinMembershipProbe` live in
 `src/scaf/probes/`; the notebook still does its own checkpoint
-reconstruction (Cell 4) before handing a live model to them. Stiffness
-becoming a Tier C probe in that same shape is the path of least surprise.
+reconstruction (Cell 4) before handing a live model to them. Stiffness is
+now a Tier C probe in that same shape.
 
 ```mermaid
 flowchart LR
     CKPTS["Checkpoints, multiple steps"]
     RECON["Reconstruct model from config"]
-    PROBE["Compute omega dt statistic"]
+    PROBE["StiffnessProbe.run(im, corpus)"]
     PLOT["Trend plot across checkpoints"]
 
     subgraph NB [Stays in notebook paper repo specific]
@@ -675,7 +683,7 @@ flowchart LR
         PLOT
     end
 
-    subgraph LIB [Moves into SCAF library unit tested]
+    subgraph LIB [Moved into SCAF library unit tested]
         PROBE
     end
 
@@ -684,46 +692,102 @@ flowchart LR
     PROBE --> PLOT
 ```
 
-**Moves to SCAF** — the statistic in §6's `_stiffness_report`, restructured
+**Moved to SCAF** — the statistic in §6's `_stiffness_report`, restructured
 around the existing `Probe` / `Capabilities` / adapter contract:
 
 ```python
-# src/scaf/core/adapters/base.py — new capability flag, alongside
-# has_vtheta_wells
+# src/scaf/core/adapters/base.py — two new capability flags and two new
+# ModelAdapter methods, alongside well_parameters()/has_vtheta_wells
 has_harmonic_terms: bool = False
 
-# src/scaf/core/adapters/fock.py — new adapter method, mirrors
-# well_parameters()'s existing shape
 def harmonic_terms(
     self, model, layer_idx, x, h=None,
-):
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return (k_diag, s) for one layer, or None if unsupported."""
-    ...
+    return None
 
-# src/scaf/probes/stiffness.py — new probe, proposed shape
+def mass(self, model, x) -> torch.Tensor | None:
+    """Per-position mass, or None if the model has no notion of one."""
+    return None
+```
+
+`FockAdapter.harmonic_terms()` turned out simpler than `well_parameters()`:
+it derives `xi` the same way (`xi_module(h)`, `set_active_layer`), then
+calls the model's own `V_theta.harmonic_terms(xi, h)` directly, with no
+manual per-head bank looping. Every Gaussian-mixture wrapper already
+aggregates across context channels and applies its own depth-code shift
+internally (`AnisotropicDepthConditionedGaussianVTheta.harmonic_terms`, for
+example) — that was true before this migration and is unchanged by it. A
+`try/except` around the call fails closed (returns `None`) rather than
+guesses at a reshape when a family's own `xi_module(h)` output does not
+match what its `harmonic_terms` expects — the one case this covers today is
+a structured quadratic well used inside a multi-context stack with no
+multi-context-aware wrapper around it (§12). `GenericAdapter` got the same
+two methods, delegating to a model's own `harmonic_terms`/`compute_mass` if
+present, exactly mirroring how it already delegates `well_parameters` —
+this is what lets a toy model be tested through ordinary adapter
+auto-detection rather than a hardcoded `FockAdapter()`.
+
+`src/scaf/probes/stiffness.py` implements `StiffnessProbe` itself:
+
+```python
 class StiffnessProbe(Probe):
     name = "stiffness"
 
-    def __init__(self, threshold: float = 2.0, marginal: float = 1.0):
-        self.threshold = threshold
-        self.marginal = marginal
+    def __init__(
+        self,
+        stability_bound: float = 2.0,
+        marginal_bound: float = 1.0,
+        frac_unstable_threshold: float = 0.0,
+        n_batches: int = 4,
+        seqs_per_batch: int = 2,
+        micro_batch: int = 4,
+        n_boot: int = 500,
+        bootstrap_seed: int = 0,
+    ) -> None: ...
 
     def run(self, im, corpus) -> ProbeResult:
         if not im.caps.has_harmonic_terms:
-            return self._skip(
-                f"adapter {im.adapter.name!r} does not expose harmonic "
-                "curvature (has_harmonic_terms=False)"
-            )
-        # ... forced-linearisation forward pass, quantiles, frac_unstable ...
+            return self._skip(...)
+        dt = im.config().get("dt")
+        if not dt:
+            return self._skip(...)
+        # n_batches independent corpus draws, each one block-bootstrap
+        # resampling unit; _chunked_trajectory for memory-safe batching;
+        # harmonic_terms() + mass() -> omega*dt per (layer, position);
+        # quantiles, frac_marginal, frac_unstable, block-bootstrap CI;
+        # if has_vtheta_wells: also a Weyl-bound cross-check via
+        # weyl_upper_bound(), reusing well_parameters()'s existing output.
         return ProbeResult(
-            name=self.name,
-            statistic=frac_unstable,
-            unit="frac_unstable",
-            threshold=0.0,
-            passed=frac_unstable <= 0.0,
-            detail={"median": ..., "p99": ..., "max": ...},
+            name=self.name, statistic=frac_unstable, unit="frac_unstable",
+            threshold=self.frac_unstable_threshold,
+            passed=frac_unstable <= self.frac_unstable_threshold,
+            detail={"median": ..., "p99": ..., "max": ..., "frac_unstable_ci95": ..., ...},
         )
 ```
+
+Two deliberate departures from the rough sketch this section used to
+contain: the constructor separates the omega\*dt stability bound
+(`stability_bound`) from the tolerance on *how much* of the run may exceed
+it (`frac_unstable_threshold`) — the original sketch reused one `threshold`
+name for both, which does not type-check against `ProbeResult`'s own
+`threshold` field once written out in full. And the Weyl-bound extension
+(§5-§8) is folded into the same probe rather than proposed as separate
+follow-on work, since it needed no new adapter surface — it is pure math
+over `well_parameters()`'s existing output.
+
+**No forced-trajectory caveat here.** §4.4 documents that the
+notebook-only `_stiffness_report` has to temporarily force
+`cfg.integrator = 'baoab_cfc'` because `harmonic_terms()` used to only ever
+be called from the CfC layer step. `StiffnessProbe` never does this: it
+gets its trajectory from
+`InterventableModel.batch_logits_with_trajectory`, which runs the model's
+own configured integrator unmodified — the same primitive
+`BasinMembershipProbe`/`HiddenStateLeakProbe` already use. The
+forced-vs-native cross-check that motivated Phase 7c
+(`docs/Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md` §3.2, §8.3)
+is therefore not a caveat this probe needs at all — it is native by
+construction, not by a second mode that has to be asked for.
 
 **Stays in the notebook** — everything that has to import
 `model_fock_parf_multixi.py` or know about `FockMultiXiPARFConfig`:
@@ -732,18 +796,20 @@ helper in §6's sidebar, the multi-checkpoint loop, and the matplotlib trend
 plot. SCAF's adapters deliberately take an already-built, already-loaded
 `nn.Module`; they do not resurrect one from a raw checkpoint dict, and this
 design keeps that boundary intact rather than pulling fast-moving
-experimental model code into a general-purpose audit library.
+experimental model code into a general-purpose audit library. Rewiring
+`scaf_checkpoint_analysis.ipynb`'s Phase 7/7b/7c call sites onto
+`StiffnessProbe` — only the call site changes, not the reconstruction or
+plotting — is tracked as a follow-up in §12, not part of this migration.
 
 <p align="center"><img src="images/scaf_stiffness_audit_migration_pipeline.png" alt="A software architecture diagram showing a left to right pipeline of four boxes: training checkpoints at several steps, then a dashed rectangle labeled today lives entirely in the notebook enclosing three boxes for reconstruct model from checkpoint config, force harmonic linearisation and run a forward pass, and compute the omega delta t statistic with quantiles and a verdict, followed by a trend plot across checkpoints box outside the dashed rectangle. Below, a second row shows the proposed future split: a dashed rectangle labeled stays in the notebook paper repo specific contains the reconstruct and force harmonic linearisation boxes, followed by a solid green rectangle labeled future migrated into the SCAF package unit tested containing a single box relabeled StiffnessProbe with the same omega delta t statistic description, followed by a second dashed rectangle labeled stays in the notebook paper repo specific containing the trend plot box. A small legend at the bottom shows a dashed swatch for notebook slash paper repo and a solid green swatch for SCAF library." width="820"></p>
 
 ---
 
-## 11. Future standalone-notebook usage
+## 11. Standalone-notebook usage
 
-Once §10's split lands, calling the stiffness probe from any notebook —
-not just this one — follows the same three-line pattern every other
-geometric probe in SCAF already uses (compare to Phase 1.5's existing Tier
-A/B call, unchanged):
+Calling the stiffness probe from any notebook — not just this one —
+follows the same three-line pattern every other geometric probe in SCAF
+already uses (compare to Phase 1.5's existing Tier A/B call):
 
 ```python
 import scaf
@@ -754,40 +820,62 @@ with scaf.InterventableModel(model, device=DEVICE, dtype="float32") as im:
     print(f"has_harmonic_terms: {im.caps.has_harmonic_terms}")
 
     if im.caps.has_harmonic_terms:
-        stiffness = scaf.StiffnessProbe(threshold=2.0).run(im, corpus)
+        stiffness = scaf.StiffnessProbe(stability_bound=2.0).run(im, corpus)
         print(stiffness)
         if not stiffness.skipped:
-            print(f"  frac_unstable = {stiffness.statistic:.3e}")
-            print(f"  max omega dt  = {stiffness.detail['max']:.3f}")
+            print(f"  frac_unstable      = {stiffness.statistic:.3e}")
+            print(f"  frac_unstable CI95 = {stiffness.detail['frac_unstable_ci95']}")
+            print(f"  max omega dt       = {stiffness.detail['max']:.3f}")
+            if "eig_max" in stiffness.detail:
+                print(f"  Weyl max omega dt  = {stiffness.detail['eig_max']:.3f}")
     else:
         print("SKIPPED -- V_theta has no closed-form curvature "
               "(expected for the plain MLP family)")
 ```
 
-What does **not** change: the checkpoint-reconstruction cell, the
-multi-checkpoint loop that calls this block once per path, and the
-matplotlib trend plot with the `WATCHDOG_RELOAD_STEPS` overlay. What
-disappears from the notebook: the inline `_stiffness_report` function and
-its `harmonic_terms` monkeypatch, replaced by the three lines above.
+What does **not** change once the notebook follow-up (§12) lands: the
+checkpoint-reconstruction cell, the multi-checkpoint loop that calls this
+block once per path, and the matplotlib trend plot with the
+`WATCHDOG_RELOAD_STEPS` overlay. What disappears from the notebook: the
+inline `_stiffness_report` function and its `harmonic_terms` monkeypatch —
+replaced by the block above, plus whatever glue the multi-checkpoint loop
+needs to call it once per reconstructed model.
 
 ---
 
-## 12. Open questions for the eventual migration
+## 12. Open follow-ups
 
+- **Rewire `scaf_checkpoint_analysis.ipynb`'s Phase 7/7b/7c onto
+  `StiffnessProbe`.** Deliberately out of scope for the SCAF-side migration
+  itself (§10's boundary argument): checkpoint reconstruction and the
+  multi-checkpoint loop stay notebook-side either way, so this is a
+  call-site change, not a design change, and can land independently once
+  this probe has been used against a couple of real checkpoints outside
+  the toy-model test suite.
+- **Structured quadratic V_theta inside a multi-context stack.** The
+  Gaussian-mixture families' multi-context wrappers
+  (`AnisotropicMultiContextGaussianVTheta`,
+  `MultiContextGaussianVTheta`/`DepthConditionedMultiContextGaussianVTheta`)
+  already sum per-channel `harmonic_terms()` internally. The structured
+  quadratic family (`QuadraticWellVTheta` and friends) has no equivalent
+  wrapper — the notebook's own `_StructuredVThetaMultiXiAdapter` bridges
+  that gap today, and it is paper-repo-specific glue, not something
+  `FockAdapter.harmonic_terms()` reimplements. A checkpoint in this
+  configuration reports `has_harmonic_terms=True` (the structural check
+  only looks for the method's presence) but `StiffnessProbe` will skip with
+  "harmonic_terms() returned None for every sampled (layer, batch)" at
+  runtime, once the `xi`/`h` shape mismatch is hit — a loud, honest failure
+  rather than a wrong number, but one that should read as "not yet
+  supported for this specific family combination," not as a bug.
 - **Should `StiffnessProbe` accept a list of checkpoints itself?** Every
   other probe in SCAF operates on one already-built `InterventableModel` at
   a time (§10's boundary argument). Keeping the multi-checkpoint loop in
-  the notebook is consistent with that and is the current recommendation;
+  the notebook is consistent with that and remains the recommendation;
   revisit only if a second caller needs the same loop and duplicates it.
-- **Toy-model test coverage.** `tests/toy_models.py` already builds toy
-  models with hand-set, exactly known well parameters for
-  `BasinMembershipProbe`. A toy model with a hand-set `k_diag` and mass
-  would let `StiffnessProbe`'s quantile and threshold logic be unit tested
-  without a GPU or a real checkpoint — closing a gap the notebook-only
-  version has never had covered.
-- **Relationship to `has_vtheta_wells`.** SQ3 and the other structured
-  quadratic families expose `harmonic_terms()` but not the
-  `_components` / `mu_proj` structure `_has_gaussian_wells()` checks for.
-  `has_harmonic_terms` therefore needs to be an independent capability
-  flag, not derived from `has_vtheta_wells` — a model can have one without
-  the other in either direction.
+- **Exact top eigenvalue (Phase 7d).** The Weyl-bound extension in
+  `StiffnessProbe` is, like its notebook predecessor, a conservative upper
+  bound, not the true top eigenvalue of the effective precision matrix —
+  see `Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md` §8.2 for
+  how loose that bound can be in practice. An exact-eigenvalue mode would
+  slot into `weyl_upper_bound`'s call site in `StiffnessProbe.run` the same
+  way the Weyl bound slotted in next to `k_diag`.

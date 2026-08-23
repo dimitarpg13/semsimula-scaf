@@ -70,6 +70,15 @@ class Capabilities:
     #: (basin-membership) probes.
     has_vtheta_wells: bool = False
 
+    #: Whether the adapter can return a closed-form harmonic linearisation
+    #: (``k_diag``, ``s``) of the force at a given hidden state. Required for
+    #: the Tier C stiffness probe. Independent of ``has_vtheta_wells``: the
+    #: structured quadratic V_theta family implements ``harmonic_terms()``
+    #: exactly but has no Gaussian-mixture ``_components``/``mu_proj``
+    #: structure, so a model can have one flag without the other in either
+    #: direction.
+    has_harmonic_terms: bool = False
+
     #: Named intervention points usable as mediators in a knockout (axiom A5),
     #: most-suspect first.
     mediators: tuple[str, ...] = ()
@@ -94,6 +103,8 @@ class Capabilities:
             bits.append("hidden-states")
         if self.has_vtheta_wells:
             bits.append("vtheta-wells")
+        if self.has_harmonic_terms:
+            bits.append("harmonic-terms")
         return ", ".join(bits) if bits else "plain"
 
 
@@ -147,6 +158,9 @@ class ModelAdapter(ABC):
             # different dynamical systems, so an audit record that omits this
             # cannot say which one it certified.
             "integrator", "vtheta_analytic_force", "langevin_T",
+            # Step size: needed to turn a per-position curvature sample into
+            # the dimensionless stability quantity omega*dt (StiffnessProbe).
+            "dt",
         )
         return {k: getattr(cfg, k) for k in keys if hasattr(cfg, k)}
 
@@ -239,6 +253,61 @@ class ModelAdapter(ABC):
         Required for Tier B (basin-membership) probes. Adapters that do not
         support wells leave ``Capabilities.has_vtheta_wells = False`` and
         probes skip loudly.
+        """
+        return None
+
+    def harmonic_terms(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return a closed-form harmonic linearisation ``(k_diag, s)`` of the
+        force at a given layer and hidden state.
+
+        The force of a conservative potential near a state ``h`` can be
+        modelled as a per-dimension linear spring::
+
+            f_harm(h') = s - k_diag * h'
+
+        ``k_diag`` is the diagonal stiffness (curvature) sampled at ``h``,
+        and ``s`` is the corresponding mean-shift term. Together with a
+        per-position mass (:meth:`mass`) and the model's step size, this is
+        exactly what a Verlet-style stability check needs:
+        :math:`\\omega = \\sqrt{k_{\\text{diag}} / m}`.
+
+        Unlike :meth:`well_parameters`, which is specific to Gaussian-mixture
+        potentials, ``harmonic_terms`` is a family-general contract: every
+        SemSimula :math:`V_\\theta` variant (Gaussian mixtures, structured
+        quadratic wells, ...) can implement it in whatever way is exact or
+        the best available approximation for that family. Adapters typically
+        implement this by deriving the model's own context vector(s) from
+        ``h`` (the same derivation :meth:`well_parameters` uses) and then
+        calling the model's own ``harmonic_terms(xi, h)`` method directly, so
+        no curvature math is duplicated in SCAF itself.
+
+        As with :meth:`well_parameters`, ``h=None`` costs a full forward
+        pass to reconstruct the trajectory; callers that already have one
+        should pass the layer's hidden state directly.
+
+        Returns ``None`` if the model has no closed-form harmonic
+        linearisation, or if ``layer_idx`` addresses no layer.
+
+        Required for the Tier C stiffness probe. Adapters that do not
+        support this leave ``Capabilities.has_harmonic_terms = False`` and
+        the probe skips loudly.
+        """
+        return None
+
+    def mass(
+        self, model: nn.Module, x: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Return the per-position inertial mass used by the model's own
+        integrator, or ``None`` if the model has no notion of mass.
+
+        Needed alongside :meth:`harmonic_terms` to turn a curvature sample
+        into a frequency, :math:`\\omega = \\sqrt{k_{\\text{diag}} / m}`.
         """
         return None
 

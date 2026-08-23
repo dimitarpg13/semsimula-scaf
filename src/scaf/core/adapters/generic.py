@@ -78,6 +78,7 @@ class GenericAdapter(ModelAdapter):
             or hasattr(model, "forward_with_trajectory")
         )
         has_wells = hasattr(model, "well_parameters")
+        has_harmonic = hasattr(model, "harmonic_terms")
 
         return Capabilities(
             requires_grad_forward=True,
@@ -90,6 +91,7 @@ class GenericAdapter(ModelAdapter):
             has_attention=getattr(model, "attn_blocks", None) is not None,
             has_hidden_states=has_trajectory,
             has_vtheta_wells=has_wells,
+            has_harmonic_terms=has_harmonic,
             mediators=mediators,
             causal_flags=flags,
             notes=tuple(notes),
@@ -118,6 +120,26 @@ class GenericAdapter(ModelAdapter):
         if hasattr(model, "well_parameters"):
             return model.well_parameters(layer_idx, x)
         return None
+
+    def harmonic_terms(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Delegate to the model's own ``harmonic_terms`` if it exists."""
+        if hasattr(model, "harmonic_terms"):
+            return model.harmonic_terms(layer_idx, x, h=h)
+        return None
+
+    def mass(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
+        """Delegate to the model's own ``compute_mass`` if it exists."""
+        compute_mass = getattr(model, "compute_mass", None)
+        if not callable(compute_mass):
+            return None
+        with torch.no_grad():
+            return compute_mass(x).detach()
 
     def intervention_points(
         self, model: nn.Module

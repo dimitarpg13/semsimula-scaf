@@ -54,6 +54,7 @@ from .probes.basin_membership import BasinMembershipProbe
 from .probes.future_perturbation import FuturePerturbationProbe
 from .probes.hidden_state import HiddenStateLeakProbe
 from .probes.mediation import MediationProbe
+from .probes.stiffness import StiffnessProbe
 from .probes.target_relocation import TargetRelocationProbe
 from .report import CausalLeakError, LeakScorecard
 
@@ -82,6 +83,7 @@ __all__ = [
     "FuturePerturbationProbe",
     "HiddenStateLeakProbe",
     "BasinMembershipProbe",
+    "StiffnessProbe",
     "TargetRelocationProbe",
     "MediationProbe",
     # controls
