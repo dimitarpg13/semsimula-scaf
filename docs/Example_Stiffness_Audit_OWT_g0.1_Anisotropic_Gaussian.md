@@ -239,7 +239,12 @@ def _recording_bank(xis, h, comps=None):
     total = torch.zeros(h.shape[:-1], device=h.device, dtype=h.dtype)
     for m_ctx in range(multi.n_ctx):
         bank_m = multi.banks[m_ctx]
-        mu_m, a_m, w_m, B_m = bank_m._components(xis[..., m_ctx, :])
+        # comps, when supplied, IS (mu, a, w, B) already -- reuse it
+        # instead of re-deriving from xis (see note below).
+        if comps is not None:
+            mu_m, a_m, w_m, B_m = comps[m_ctx]
+        else:
+            mu_m, a_m, w_m, B_m = bank_m._components(xis[..., m_ctx, :])
         diff = h.unsqueeze(-2) - mu_m
         diag_term = (a_m * diff * diff).sum(dim=-1)
         Bt_diff = torch.einsum('...kd,...kdr->...kr', diff, B_m)
@@ -261,6 +266,28 @@ would have called them anyway. `_recording_bank` is skipped entirely
 (`_has_aniso=False`) for families with no `.banks` structure or with
 `rank=0` everywhere, where `k_diag` is already exact and there is nothing
 to bound.
+
+**The `comps is not None` branch is load-bearing, not an optimisation.**
+`_layer_step_langevin` always precomputes
+`vtheta_comps = self.V_theta.context_components(xis)` and forwards it as
+`comps=vtheta_comps` — `context_components` exists on the depth-conditioned
+wrapper, so this path is taken on every real call. The depth-conditioned
+wrapper's own `_maybe_shift(xis, comps)` then *skips applying the
+depth-shift to `xis` whenever `comps` is given*, because `xis` is unused
+by the rest of the real call chain in that case — only `comps` (which
+`context_components` already derived from the correctly shifted context)
+is used. `_recording_bank` receives whatever `_maybe_shift` produced, so
+if it ignored `comps` and re-derived `(mu, a, w, B)` from `xis` via
+`bank_m._components(...)`, it would silently use the *unshifted* context
+— correct only for the layer whose shift code happens to be zero. Reusing
+`comps[m_ctx]` sidesteps this entirely: it is exactly what the real
+forward pass used to compute `k_diag_b`/`s_b` a moment earlier in the same
+call, so the Weyl-bound term is guaranteed to describe the same wells.
+This is also what makes the "zero extra GPU cost" claim precise rather
+than approximate: with `comps` reused, Phase 7b adds no repeated linear
+projections at all — only the `O(K \cdot r^2)` eigendecompositions of the
+small `r \times r` Gram matrices, on parameters the model already
+computed.
 
 This has been implemented in `_stiffness_report` and lands in the
 returned dict as `eig_median` / `eig_p90` / `eig_p99` / `eig_p999` /
