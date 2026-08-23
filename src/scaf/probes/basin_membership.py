@@ -69,6 +69,17 @@ def assign_dominant_wells(
     Returns:
         Integer tensor of dominant well indices, shape ``(B, T)`` or ``(B,)``.
     """
+    # Well parameters come from the adapter's own forward pass and land on
+    # the model's device (e.g. cuda:0); h is frequently a CPU-resident
+    # trajectory slice (hidden-state trajectories are moved to CPU to bound
+    # peak memory — see hidden_state._chunked_trajectory). Normalise every
+    # well tensor to h's device/dtype here rather than trusting the caller,
+    # since this is a public, standalone function used outside probes too.
+    mu = mu.to(device=h.device, dtype=h.dtype)
+    precision_diag = precision_diag.to(device=h.device, dtype=h.dtype)
+    precision_lr = precision_lr.to(device=h.device, dtype=h.dtype)
+    weights = weights.to(device=h.device, dtype=h.dtype)
+
     has_T = h.dim() == 3
     if has_T:
         # h: (B, T, d) → (B, T, 1, d)  for broadcasting against K wells

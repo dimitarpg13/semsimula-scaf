@@ -114,6 +114,48 @@ class TestAssignDominantWells:
         result = assign_dominant_wells(h, mu, a, B, w)
         assert result.shape == (B_sz,)
 
+    def test_mismatched_dtype_well_params_does_not_raise(self):
+        """Well params in a different dtype than h must be coerced, not crash.
+
+        Mirrors the real failure mode this normalisation guards against:
+        FockAdapter.well_parameters() derives mu/precision/weights on the
+        model's own device+dtype, while h is frequently a CPU-resident
+        trajectory slice of a possibly different dtype (see
+        hidden_state._chunked_trajectory). A caller that forgets to
+        pre-align devices/dtypes must still get a correct answer, not a
+        RuntimeError.
+        """
+        K, d, r = 3, 8, 2
+        mu = torch.randn(K, d, dtype=torch.float64)
+        a = torch.ones(K, d, dtype=torch.float64)
+        B = torch.zeros(K, d, r, dtype=torch.float64)
+        w = torch.ones(K, dtype=torch.float64) / K
+
+        h = mu[1].to(torch.float32).unsqueeze(0)  # (1, d), float32
+        result = assign_dominant_wells(h, mu, a, B, w)
+        assert result.item() == 1
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="requires a CUDA device"
+    )
+    def test_mismatched_device_well_params_does_not_raise(self):
+        """CPU h with CUDA well params must not raise a device-mismatch error.
+
+        Direct regression test for the bug seen running Tier B against a
+        real GPU-resident aniso-Gaussian checkpoint: hidden-state
+        trajectories are kept on CPU to bound peak memory while
+        well_parameters() returns tensors on the model's CUDA device.
+        """
+        K, d, r = 3, 8, 2
+        mu = torch.randn(K, d, device="cuda")
+        a = torch.ones(K, d, device="cuda")
+        B = torch.zeros(K, d, r, device="cuda")
+        w = torch.ones(K, device="cuda") / K
+
+        h = mu[1].cpu().unsqueeze(0)  # (1, d), CPU
+        result = assign_dominant_wells(h, mu, a, B, w)
+        assert result.item() == 1
+
 
 # ---------------------------------------------------------------------------
 # Capability detection
