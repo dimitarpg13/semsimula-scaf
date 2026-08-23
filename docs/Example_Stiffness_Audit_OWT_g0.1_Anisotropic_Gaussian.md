@@ -1,10 +1,12 @@
 # Example Stiffness Audit: OWT, γ=0.10, Anisotropic Gaussian, Verlet-Trained
 
-**Status:** worked example against a real run, plus a design extension
-(Phase 7b) that has been implemented in the notebook but not yet executed
-against this checkpoint's own weights. §3's numbers are real measurements;
-§5-§7's Weyl-bound statistic is verified against synthetic data (§6) but
-still pending a real run (§8) — this document says exactly which is which
+**Status:** worked example against a real run. §3 and §8 are both real
+measurements from this checkpoint's own weights (Phase 7 and Phase 7b
+respectively, both in the default forced-trajectory mode); §6 verifies the
+Weyl-bound inequality against synthetic data, not this checkpoint. Phase
+7c (§3.2, the native-trajectory cross-check) and the exact-eigenvalue
+check (§8.2, §11) have been implemented / designed but not yet run against
+this checkpoint's own weights — this document says exactly which is which
 throughout.
 
 **Companion:**
@@ -87,7 +89,43 @@ watchdog reloads** — at least not on the validation windows sampled here,
 and not at the specific steps audited.
 
 That conclusion needs the caveat in §4-§7 before it can be trusted,
-because of exactly what family is under test.
+because of exactly what family is under test — and a second, independent
+caveat about which hidden states it was even measured at, below.
+
+### 3.2 Caveat: which trajectory produced these numbers?
+
+§1 records this run's integrator "as trained" as Velocity-Verlet, and that
+matters for how §3's numbers were produced. `harmonic_terms()` — the
+function that turns frozen weights into a $K(h)$ sample — is only ever
+called from `_layer_step_langevin`, never from `_layer_step` (the real code
+path this checkpoint's own Verlet training and inference actually use). To
+read `k_diag` off a Verlet-configured model at all, Phase 7's default mode
+temporarily forces `cfg.integrator = 'baoab_cfc'` for the duration of the
+probe's forward passes, then restores it.
+
+That forcing is not free of side effects. `_layer_step` and
+`_layer_step_langevin` compute `h_new` with different functional forms from
+the same inputs, so beyond layer 0 (whose input is the
+integrator-independent token+position embedding) the numbers in §3's table
+were measured at hidden states this checkpoint's *own* Verlet forward pass
+would not actually visit — the same trained weights, run through a
+different, numerically friendlier stand-in integrator instead. Full
+derivation in
+[`Stiffness_Audit_Requirements_and_Design.md`](Stiffness_Audit_Requirements_and_Design.md)
+§4.4.
+
+A `native=True` mode now exists specifically to close this gap: it leaves
+`cfg.integrator` untouched and instead hooks `_layer_forces` to sample
+`harmonic_terms()` at the real `(h, xis)` the checkpoint's own Verlet step
+is evaluating a force at, so `h_new` stays bit-identical to an unhooked
+forward pass. It has not yet been run against this run's own four
+checkpoints — that is Phase 7c in the notebook, and it is an open
+follow-up (§11), not a result folded into §3's table. Given how far below
+the bound §3's numbers already sit (`max=0.632` against a threshold of
+`2.0`), the forced-trajectory bias is unlikely to flip the "not
+curvature-limited" verdict for this specific run, but the table above
+should be read as measured on a numerically-safe stand-in trajectory, not
+on the trajectory this checkpoint's own Verlet inference actually produces.
 
 ---
 
@@ -299,35 +337,160 @@ passes of its own.
 
 ---
 
-## 8. What running it would tell us
+## 8. Real results
 
-Phase 7b has not yet been run against this run's own four checkpoints —
-that is the natural next step, not a result this document can report yet.
-Three possible outcomes, and what each would mean:
+Phase 7b has now been run against this run's own four checkpoints
+(`STIFFNESS_N_BATCHES=16`, `STIFFNESS_BATCH_SZ=2`, `STIFFNESS_BLOCK_LEN=256`
+— same settings as §3):
 
-| Outcome | Reading |
+| step | diag max | Weyl max | diag frac(>2) | Weyl frac(>2) |
+| --- | --- | --- | --- | --- |
+| 9000 | 0.6319 | 4.2452 | 0.000e+00 | 5.282e-02 |
+| 9500 | 0.3423 | 2.7128 | 0.000e+00 | 5.619e-02 |
+| 10000 | 0.4711 | 2.9264 | 0.000e+00 | 5.932e-02 |
+| 15000 | 0.4182 | 2.6572 | 0.000e+00 | 6.206e-02 |
+
+<p align="center"><img src="images/scaf_example_owt_g0_1_phase7b_real_diag_vs_weyl.png" alt="A two panel chart sharing the training step x axis. The top panel plots omega times delta t against training step for the same four checkpoints as before, with a flat blue diagonal proxy curve sitting well under 1 throughout while an orange Weyl bound curve dips from about 4.25 at step 9000 to around 2.7 to 2.9 and stays there through step 15000, with a dotted horizontal line at 2 marking the Verlet stability bound that the orange curve sits clearly above at every point while the blue curve sits clearly below. The bottom panel plots the percentage of sampled token and layer positions with omega times delta t exceeding 2, with the blue diagonal proxy flat at exactly zero percent throughout, annotated as such, while the orange Weyl bound curve climbs steadily from about 5.3 percent at step 9000 to about 6.2 percent at step 15000." width="820"></p>
+
+### 8.1 Reading it against the three outcomes this document anticipated
+
+An earlier draft of this section, written before Phase 7b had been run,
+laid out three possible outcomes and what each would mean:
+
+| Anticipated outcome | Reading |
 | --- | --- |
-| `eig_max` stays comfortably below 2 at all four steps, similar margin to `max` | the diagonal blind spot is real in principle (§5-§6) but this run's actual wells happen not to exploit it; the reload mechanism is something other than well curvature entirely |
-| `eig_max` crosses 1 or 2 at steps near the reload cluster (`10000`-`15000`, the unaudited gap in §3's figure) while `k_diag`'s `max` stays flat | direct mechanistic evidence that the rotated, off-diagonal direction is exactly what `k_diag` was missing, and the val_ppl backslide in §9 has a concrete curvature explanation |
-| `eig_max` is large everywhere, including at steps far from any reload | the Weyl bound is too loose at this `rank=4` to be actionable on its own, and a tighter (but more expensive) exact-eigenvalue check on the small per-well precision matrices would be the next escalation, not a conclusion either way |
+| `eig_max` stays comfortably below 2 at all four steps | the diagonal blind spot is real in principle (§5-§6) but this run's wells happen not to exploit it |
+| `eig_max` crosses 1 or 2 only near the reload cluster (`10000`-`15000`), while `k_diag`'s `max` stays flat | direct mechanistic evidence tying the rotated direction to the reloads |
+| `eig_max` is large everywhere, including far from any reload | the Weyl bound may be too loose at this `rank=4` to be actionable on its own |
 
-Either of the first two outcomes is informative; only the third would
-require more work before the audit says anything new.
+The real result lands closest to the **third** row, with an important
+qualification. `eig_max` is large at every audited step (`2.66`-`4.25`,
+all above the `2.0` bound), not concentrated near the reload cluster the
+second row described — but unlike a flat, uninformative "large
+everywhere," `Weyl frac(>2)` moves in a clear, monotonic trend across the
+run: `5.28% -> 5.62% -> 5.93% -> 6.21%`, tracking training step rather than
+sitting at noise level. That trend is a real signal even though the bound
+itself may be loose (§8.2): it says the off-axis curvature the diagonal
+proxy cannot see is not a fixed artifact of the architecture, it is
+*growing* while the diagonal proxy stays flat and the watchdog kept firing
+throughout this entire window (15 reloads between step 8925 and 16824,
+§1).
+
+### 8.2 What this result does NOT yet establish
+
+$K_{\text{Weyl}}(h)$ is an upper bound, not the true top eigenvalue — and §6's
+synthetic check already measured how loose it can be: a mean gap of
+`3.77` against true eigenvalues typically in the `5`-`18` range, i.e. the
+bound can overshoot by an amount comparable to the quantity itself. A
+`Weyl frac(>2)` of `5`-`6%` is therefore a **ceiling** on how much of this
+run genuinely crossed the Verlet stability line via the rotated direction,
+not a measurement of it. The true fraction could be much smaller than
+`5`-`6%` — potentially close to `0`, if the gap for this specific
+`rank=4`, `d=384` model runs as large relative to typical eigenvalues as it
+did in the `rank=4`, `d=16` synthetic check. Two further checks would
+resolve this, both flagged as open follow-ups (§11):
+
+- **The exact top eigenvalue**, not the additive Weyl bound, computed
+  directly from this checkpoint's own per-token effective matrix
+  $\sum_k g_k P_k$ (tractable at `rank=4` via `torch.linalg.eigvalsh` on
+  the small, explicitly-formed `(d, d)` matrix — expensive next to the
+  diagonal or Weyl statistics, but not next to a full forward pass, since
+  it only needs to run per sampled `(batch, token, layer)` position, not
+  per training step).
+- **The native-trajectory cross-check (Phase 7c, §3.2)**, since these
+  numbers — like §3's — were measured with `cfg.integrator` forced to
+  `'baoab_cfc'` for the duration of the probe, at hidden states this
+  checkpoint's own Verlet training does not actually visit past layer 0.
+  Because CfC's own harmonic sub-step is specifically designed not to
+  develop the excursions that would make Verlet unsafe, the forced
+  trajectory is if anything biased toward showing *less* off-axis
+  curvature than the checkpoint's real Verlet trajectory would, not more
+  — so the true `Weyl frac(>2)` under the native trajectory could be
+  higher than what is reported here, not lower.
 
 ---
 
-## 9. Corroborating context: the val_ppl backslide
+## 9. Corroborating context: the val_ppl backslide, and why the gap cannot be filled after the fact
 
 Independent of the curvature question, `val_ppl` in §3's table is not
 monotonically improving: `194.68 -> 191.84 -> 184.11` through step 10000,
 then **backsliding to 192.53 by step 15000** — worse than both step 9500
-and step 10000. That backslide sits inside the exact gap where no
-checkpoint was audited and where the reload cluster is densest
-(`11550`-`13903`, plus the next cluster starting at `15434`, just past the
-last audited step). It is consistent with training still being actively
-disrupted through this window even while the diagonal curvature signal
-stays flat — which is precisely the kind of discrepancy §8's second
-outcome would resolve.
+and step 10000. The natural next question is whether more checkpoints
+from inside that gap — especially from the densest part of the reload
+cluster (`11550`-`13903`) — would sharpen this picture. They would, but
+none exist: this section works out exactly why, using only
+`training_log.jsonl` (no model weights needed), and what that absence
+itself is worth as evidence.
+
+**The full-resolution picture is more informative than the four audited
+points alone.** Reading every `EVAL_INTERVAL=500` row of the log between
+steps `9000` and `17000` (the point this run was manually stopped, per
+§1), not just the four steps that happen to have a checkpoint on disk:
+
+<p align="center"><img src="images/scaf_example_owt_g0_1_best_ppl_frozen_no_checkpoint_gap.png" alt="A scatter plot of val_ppl against training step from 9000 to 17000, with roughly twenty green points scattered noisily between about 185 and 197, and a dashed red horizontal line at 184.1 labeled best_ppl frozen from step 10000 onward that every single point after step 10000 sits above. Thin grey vertical lines mark real watchdog reload steps clustering most densely between about 11000 and 14000, with a light red shaded band spanning the full 10000 to 17000 range. Red annotation text in the upper portion states that best_ppl never improves again in the entire logged run and that the only save trigger that could have produced a checkpoint here never fires." width="820"></p>
+
+`best_ppl` is set at step `10000` (`184.11`) and **never improves again
+anywhere in the logged run** — not by step `15000`, not by the log's last
+row at step `17000`. That is roughly 7,000 steps, and every reload from
+`10409` onward, spent making zero net progress on the metric the
+checkpoint-saving logic actually cares about.
+
+**Why that specifically means no checkpoint exists to add.** The training
+notebook's checkpoint logic
+(`colab_fock_aniso_gaussian_fockreg_openwebtext.ipynb`) has exactly two
+independent save triggers, and a watchdog reload does not touch either
+one directly:
+
+```python
+if (step + 1) % EVAL_INTERVAL == 0:
+    val_loss = evaluate()
+    val_ppl = math.exp(val_loss)
+    is_best = val_ppl < best_val_ppl
+    if is_best:
+        best_val_ppl = val_ppl
+    ...
+    if is_best:
+        save_checkpoint(step + 1, val_loss, tag_suffix='_best')
+
+if (step + 1) in set(CKPT_STEPS):        # CKPT_STEPS: every CKPT_INTERVAL=7,500 steps
+    ...
+    save_checkpoint(step + 1, val_loss)
+```
+
+`_reload_best()` (the watchdog's action) restores the model and optimizer
+state from the last saved best checkpoint, but it does **not** rewind the
+`for step in range(...)` loop counter — training keeps advancing through
+real step numbers throughout the reload cluster, it is not stuck replaying
+the same steps. So the gap is not a bug that silently discards steps; it
+is two ordinary triggers simply never firing across that span, for two
+different reasons:
+
+1. The periodic grid (`CKPT_INTERVAL=7,500`) has no milestone strictly
+   between `10000` and `15000` by construction — true even in a perfectly
+   stable run, unrelated to the reloads.
+2. The `_best` trigger requires `val_ppl < best_val_ppl`, and per the plot
+   above that never happens again after step `10000` — which *is*
+   directly a consequence of the reload cluster: nine of this window's
+   eleven reloads (`10409` through `13903`) keep resetting the model back
+   toward its step-`10000` state, so it never gets the chance to both beat
+   that PPL *and* have that better state preserved before the next reload
+   arrives.
+
+In other words: the checkpoint gap is not an oversight to fix by
+requesting different steps be saved after the fact — the run never
+produced weights inside that window that the save logic considered worth
+keeping. **The gap's existence is itself evidence, cheaply obtained from a
+log file that already exists:** a 7,000-step stretch of zero net
+`val_ppl` progress, coincident with the entire remaining watchdog history
+of this run, corroborates the curvature-side story in §8 without needing
+any additional GPU time — it just cannot supply the `harmonic_terms()`
+values a Phase 7b audit of that specific window would need.
+
+Section 11 turns this into a concrete forward-looking recommendation: a
+small change to the watchdog's own reload path so that *future* runs
+capture the one thing this run's logic was never designed to keep — a
+snapshot of the state that triggered the reload, not just the states that
+recovered from one.
 
 ---
 
@@ -336,35 +499,82 @@ outcome would resolve.
 - Phase 7's real measurements at four checkpoints of this OWT
   `gamma_train=0.10` Verlet run show no axis-aligned Verlet instability:
   `max(omega*dt)` never exceeds `0.632`, `frac(omega*dt>2)=0` everywhere.
+  These numbers come from Phase 7's default forced-trajectory mode (§3.2);
+  Phase 7c's native-trajectory cross-check has not yet been run against
+  this checkpoint set to confirm the forced substitution did not
+  materially change them.
 - That result is only a certificate along coordinate axes. The anisotropic
   Gaussian family's low-rank correction is specifically the mechanism that
   can hide curvature off-axis, and it is verified (§6, synthetically) that
   the diagonal proxy strictly underestimates the true worst-case curvature
   whenever the low-rank correction is non-trivial.
-- Phase 7b (§7) closes that gap with a Weyl-inequality upper bound,
-  implemented as a chained monkeypatch that reuses Phase 7's own forward
-  passes rather than running new ones. It has not yet been run against
-  this run's checkpoints — §8 lays out what each possible result would
-  mean once it is.
+- **Phase 7b has now been run against this run's own checkpoints (§8), and
+  it flips the picture.** The Weyl upper bound crosses the `2.0` Verlet
+  stability line at **every** audited checkpoint (`eig_max` from `2.66` to
+  `4.25`), with `5.3%`-`6.2%` of sampled `(token, layer)` positions flagged
+  — a fraction that climbs steadily across the run — while the diagonal
+  proxy reports exactly `0%` throughout. This is not yet a confirmed
+  instability, because the Weyl bound is provably conservative and §6's
+  own synthetic check showed it can overshoot the true top eigenvalue by
+  an amount comparable to the eigenvalue itself; §8.2 lays out the two
+  follow-ups (exact eigenvalue, native trajectory) needed to know how much
+  of the flagged `5`-`6%` is real.
 - The `val_ppl` trajectory backslides right in the unaudited gap between
-  step 10000 and step 15000, which is independent evidence that something
-  was still wrong in that window regardless of what the curvature audit
-  eventually shows.
+  step 10000 and step 15000, and the full-resolution log (§9) shows
+  `best_ppl` frozen at its step-10000 value for the rest of the logged run
+  (through step 17000) — independent evidence that something was still
+  wrong in that window regardless of what the curvature audit eventually
+  shows.
+- **That same gap cannot be filled with more checkpoints after the fact**
+  (§9): the only save trigger that would have produced a checkpoint there
+  (`val_ppl` beating the running best) never fired, because the reload
+  cluster itself kept preventing the net progress that trigger requires.
+  The absence of a checkpoint is therefore not a missing convenience but a
+  direct, cost-free (log-only) corroboration of the same instability.
 
 ---
 
 ## 11. Open follow-ups
 
-- **Run Phase 7b against this run's own checkpoints** and update §8's
-  table with the real outcome — the natural next step, deliberately left
-  undone here so this document does not claim a result it has not
-  measured.
-- **Extend the checkpoint list into the unaudited gap** (`10000`-`15000`)
-  so the reload cluster at `11550`-`13903` has its own audited points
-  rather than being bracketed from outside.
-- **A tighter (exact) alternative to the Weyl bound**, if §8's third
-  outcome occurs: since `rank=4` is small, computing the exact top
-  eigenvalue of each $d \times d$ matrix $P_k$ via a rank-4 secular
-  equation (rather than Weyl's looser, additive bound) would tighten the
-  certificate at some extra implementation cost — worth doing only if the
-  Weyl bound itself proves too conservative to be actionable.
+- **Compute the exact top eigenvalue** of this checkpoint's own per-token
+  effective matrix $\sum_k g_k P_k$ (§8.2) rather than the additive Weyl
+  bound, to find out how much of the `5`-`6%` flagged fraction survives
+  once the bound's known looseness is removed. `rank=4` is small enough
+  that a full `torch.linalg.eigvalsh` on the small, explicitly-formed
+  `(d, d)` matrix per sampled position is tractable (a rank-4 secular
+  equation on the diagonal-plus-low-rank structure would be the cheaper,
+  more surgical alternative if the explicit-matrix approach turns out to
+  be too memory-hungry at this `d=384`). This is the natural escalation
+  the design doc's original open questions anticipated for exactly this
+  situation — the Weyl bound flagging a large, non-trivial fraction
+  everywhere rather than staying quiet or spiking only near the reload
+  cluster.
+- **Run Phase 7c (`native=True`) against this run's own checkpoints** and
+  update §3.2 and §8.2 with the real gap between the forced and native
+  trajectories for this checkpoint set — now higher priority than before,
+  since §8's result is no longer "comfortably safe either way" but a
+  borderline signal that the forced-vs-native trajectory choice could
+  plausibly move in either direction.
+- ~~Extend the checkpoint list into the unaudited gap (`10000`-`15000`)~~
+  — not possible for this run: §9 shows no checkpoint was ever saved
+  there, because `best_ppl` never improved past its step-`10000` value
+  again for the rest of the logged run, so the `_best` save trigger simply
+  never fired inside that window. The two available substitutes are:
+  - **checkpoints from *before* the first reload** (e.g. steps `8000`,
+    `8500`, before the `8925` reload) to establish a pre-instability
+    baseline for `Weyl frac(>2)`, which this document's four checkpoints
+    cannot supply since all four postdate it;
+  - the log-only evidence in §9, which needs no additional checkpoints at
+    all and already shows the mechanism's downstream effect on `val_ppl`.
+- **Add a pre-reload checkpoint snapshot to the training notebooks**
+  (`colab_fock_aniso_gaussian_fockreg_openwebtext.ipynb` and
+  `colab_fock_cfc_baoab_aniso_gaussian_openwebtext_d384.ipynb`, both of
+  which share the same `_reload_best()` logic), so that *future* runs do
+  not have this same blind spot: save a checkpoint of the about-to-be-
+  discarded state at the moment the watchdog fires, before restoring the
+  last best. That state — not any of the recovered-and-still-failing
+  states this run happened to save — is the one a stiffness audit most
+  wants to see, and no amount of `STIFFNESS_N_BATCHES` sampling can
+  substitute for it if the weights were never written to disk in the
+  first place. This is purely a training-time change, not an audit-time
+  one.

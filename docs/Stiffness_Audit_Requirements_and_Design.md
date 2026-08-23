@@ -24,8 +24,10 @@ integrator's own step size would make that step unstable?**
 That question has a closed-form answer for every $V_\theta$ family that
 exposes a harmonic linearisation of its force (§3, §4.2), and it can be asked
 retroactively against a checkpoint that already exists — it needs no
-retraining, no gradient-norm log, and does not care which integrator the
-checkpoint actually trained under.
+retraining and no gradient-norm log. It does not need the checkpoint to have
+trained with CfC/BAOAB specifically, but *which* integrator it forces on for
+the duration of the probe does change which hidden states get measured for
+any checkpoint deeper than one layer — see §4.4.
 
 ---
 
@@ -64,8 +66,9 @@ later reloaded."
 For a frozen checkpoint and a batch of real validation tokens, the audit:
 
 1. Runs one forward pass with the harmonic linearisation of $V_\theta$
-   forced on, regardless of which integrator the checkpoint actually trained
-   under (§4.3 explains why this is safe).
+   forced on, by default regardless of which integrator the checkpoint
+   actually trained under (§4.4 explains the trade-off this makes, and the
+   alternative that avoids it).
 2. At every layer, evaluates the diagonal curvature $K(h)$ — the code
    identifier for this quantity is `k_diag` — and the mass $\mathfrak{m}$
    the model already computes for its own dynamics (`compute_mass`).
@@ -96,7 +99,7 @@ production notebooks:
 | Schema | Carries | Produced by |
 | --- | --- | --- |
 | `model_cfg` schema | `ckpt['model_cfg']`, `ckpt['step']` | the OWT production notebooks (`colab_fock_aniso_gaussian_fockreg_openwebtext.ipynb`, the CfC/BAOAB variant) |
-| `recipe` schema | `ckpt['recipe']`, `ckpt['cell']` | `colab_fock_multixi_structured_vtheta.ipynb` (SQ1-4 structured $V_\theta$ recipes and the MLP baseline) |
+| `recipe` schema | `ckpt['recipe']`, `ckpt['cell']` | `colab_fock_multixi_structured_vtheta.ipynb` (SQ1-4 structured `V_theta` recipes and the MLP baseline) |
 
 Reconstruction tries the `model_cfg` path first and falls back to the
 `recipe` path on a `no model_cfg` error, so a mixed list of checkpoints from
@@ -110,7 +113,7 @@ family can expose. Every family is checked structurally (never guessed from
 a name string) and the audit skips loudly, per checkpoint, rather than
 silently substituting a value it cannot justify:
 
-| $V_\theta$ family | Has `harmonic_terms()` | Exactness |
+| `V_theta` family | Has `harmonic_terms()` | Exactness |
 | --- | --- | --- |
 | Plain MLP (`ScalarPotentialMultiXi`) | No | not applicable — no closed-form curvature |
 | Isotropic Gaussian (`MixtureGaussianVTheta` and depth-conditioned wrapper) | Yes | exact — no low-rank term to approximate |
@@ -125,12 +128,13 @@ labelled skip, not a zero and not a crash.
 ### 4.3 Non-functional requirements
 
 - **Integrator-agnostic.** The checkpoint does not need to have trained
-  with CfC/BAOAB, or with any particular integrator. The audit forces the
-  harmonic branch on for the duration of the probe and restores the
-  checkpoint's own `integrator` / `vtheta_analytic_force` settings in a
-  `finally` block, so a Verlet-trained checkpoint and a CfC/BAOAB-trained
-  checkpoint are scored on the same footing: "how stiff would a Verlet step
-  be here."
+  with CfC/BAOAB, or with any particular integrator, to be audited at all.
+  By default the audit forces the harmonic branch on for the duration of
+  the probe and restores the checkpoint's own `integrator` /
+  `vtheta_analytic_force` settings in a `finally` block — but "forces the
+  harmonic branch on" is not free of side effects on a Verlet-trained
+  checkpoint; see §4.4 for exactly what it changes and the `native=True`
+  alternative that avoids it.
 - **Deterministic at eval.** Gumbel routing noise and the Langevin
   thermostat (when the checkpoint trained with one) must be disabled for
   the duration of the probe, or the statistic measures noise instead of
@@ -145,6 +149,116 @@ labelled skip, not a zero and not a crash.
   actually needs to be large enough is the number of *distinct* validation
   sequences sampled, because a stiff excursion is a property of specific
   token contexts, not i.i.d. noise spread evenly across the corpus.
+
+### 4.4 Which trajectory does the audit measure?
+
+`harmonic_terms()` is reachable from exactly one code path. The model has
+two, dispatched by `cfg.integrator`:
+
+```python
+def _layer_step_ex(self, h, h_prev, m_b, gamma, dt, layer_idx=0) -> tuple:
+    """Dispatch to the configured integrator."""
+    if getattr(self.cfg, "integrator", "verlet") == "verlet":
+        return self._layer_step(h, h_prev, m_b, gamma, dt, layer_idx), h
+    return self._layer_step_langevin(
+        h, h_prev, m_b, gamma, dt, layer_idx=layer_idx,
+    )
+```
+
+`_layer_step` — the genuine, historical, damped velocity-Verlet update, and
+the one every Verlet-trained checkpoint actually runs — computes its force
+directly and never calls `harmonic_terms()`; the diagonal/off-diagonal split
+that method exposes has no consumer there. Only `_layer_step_langevin`
+(reached when `cfg.integrator` is `'baoab'` or `'baoab_cfc'`) calls it,
+because `cfc_substep` needs the split to integrate the stiff part exactly.
+So the only way to get a curvature reading out of a Verlet-configured model
+**at all** is to make it run `_layer_step_langevin` instead — hence forcing
+`cfg.integrator = 'baoab_cfc'` for the probe's forward passes.
+
+**What that substitution costs.** `_layer_step` and `_layer_step_langevin`
+compute `h_new` with different functional forms from the same inputs — one
+combined implicit-friction position update versus an A–B–O–A substep
+sequence — so they are not two labels for the same map. The only state
+guaranteed to be identical between "the checkpoint's real Verlet forward
+pass" and "the probe with `baoab_cfc` forced" is the *input* to layer 0: the
+token+position embedding and its zero-velocity convention, both
+integrator-independent. From layer 1 onward, every `h` the forced probe
+evaluates `harmonic_terms()` at is a hidden state produced by the *same
+weights* under a different, numerically friendlier integrator — not the
+state this checkpoint's own inference would actually visit. In the regime
+that matters most (a well stiff enough to threaten Verlet's stability), this
+is a soft bias in one particular direction: CfC's harmonic sub-step is
+designed not to develop the large excursions that would make Verlet unsafe
+in the first place, so the forced probe's own trajectory tends to stay
+closer to the wells than a genuinely struggling Verlet run would.
+
+For the OWT $\gamma=0.10$ anisotropic-Gaussian audit in
+[`Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md`](Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md)
+the measured $\omega \Delta t$ stayed far under the `2.0` threshold (max
+`0.63`), so this bias is very unlikely to have flipped the "not
+curvature-limited" verdict — but it is exactly the kind of gap that should
+not be silently relied on for a checkpoint closer to the edge.
+
+**`native=True` avoids the substitution.** Instead of overriding
+`cfg.integrator`, it leaves it untouched — so `_layer_step_ex` dispatches
+exactly as it would outside the probe — and hooks `_layer_forces`, the one
+call both `_layer_step` and `_layer_step_langevin` funnel through, to invoke
+`harmonic_terms()` as a side query at the real `(h_in, xis)` the model is
+about to evaluate a force at:
+
+```python
+_orig_layer_forces = mdl._layer_forces
+
+def _layer_forces_probed(h_in, xis, layer_idx, *, split=False,
+                          vtheta_comps=None):
+    comps = (mdl.V_theta.context_components(xis)
+             if hasattr(mdl.V_theta, "context_components") else None)
+    mdl.V_theta.harmonic_terms(xis, h_in, comps=comps)  # side query only
+    return _orig_layer_forces(
+        h_in, xis, layer_idx, split=split, vtheta_comps=vtheta_comps)
+
+mdl._layer_forces = _layer_forces_probed
+```
+
+The wrapper's return value is exactly `_orig_layer_forces`'s own return
+value, untouched, so `h_new` — and therefore the whole forward pass's
+output — is bit-identical to an unhooked run; the `harmonic_terms()` call is
+pure bookkeeping on the side. This was checked directly on a small
+CPU model: with the hook installed, `mdl(x)` produced logit-identical
+output to an unhooked call, `cfg.integrator` was unchanged throughout, and
+on a single-layer model (where there is no downstream layer for the two
+approaches to disagree about) `native=True` and the default forced mode
+reported the exact same $\omega \Delta t$ quantiles to full float
+precision — the two modes only diverge once there is a layer 1 for the
+forced probe's substituted trajectory to have drifted at.
+
+```mermaid
+flowchart TB
+    subgraph FORCED["default: cfg.integrator forced to baoab&#95;cfc"]
+        F0["layer 0: h from embeddings (same either way)"]
+        F1["layer 1..L: h from the CfC/BAOAB update rule"]
+        F0 --> F1
+    end
+    subgraph NATIVE["native=True: cfg.integrator left untouched"]
+        N0["layer 0: h from embeddings (same either way)"]
+        N1["layer 1..L: h from the checkpoint's OWN update rule"]
+        N0 --> N1
+    end
+    NOTE["harmonic&#95;terms sampled at every layer either way -- only WHERE differs past layer 0"]
+    F1 -.-> NOTE
+    N1 -.-> NOTE
+```
+
+`native=True` costs a little more than the default mode: the default mode's
+Weyl-bound extension (Phase 7b) reuses `context_components`'s output because
+the real CfC step already computed it; the native hook must derive it
+itself, since Verlet and plain BAOAB never need it. Both cases are cheap
+linear projections plus a handful of small `r x r` eigendecompositions, far
+below the cost of another full forward pass — it is not the "rerun the
+model a second time" alternative that native fidelity would otherwise
+imply. It is a no-op (identical to the default mode, with nothing to
+substitute for) when the checkpoint's own `cfg.integrator` is already
+`'baoab_cfc'`.
 
 ---
 
@@ -169,6 +283,33 @@ checkpoints saved on both sides of that window (for example steps 8000,
 One checkpoint after a stall confirms the model is currently stiff; a
 bracketing series shows whether stiffness was rising into the reload or
 appeared abruptly at it.
+
+Two placements are consistently the highest-value additions to an
+existing, sparse list, in priority order:
+
+1. **A checkpoint from before the *first* logged reload.** Every
+   checkpoint already in the list may postdate the run's first
+   instability symptom, in which case the audit can only ever show "already
+   elevated," never "became elevated." A pre-first-reload checkpoint turns
+   that into a real before/after comparison: if `frac_unstable` there is
+   near zero and only rises approaching the first reload, that is much
+   stronger evidence that the statistic is tracking the onset of
+   instability rather than describing a fixed property this
+   architecture/family always has.
+2. **Checkpoints inside the densest reload cluster**, not just at its
+   edges. A run's reloads are rarely evenly spaced; if six reloads land in
+   a 2,500-step span while the rest of the run has one every 5,000+ steps,
+   that dense span is where a real mechanistic link between the statistic
+   and the reload trigger would be most visible as a *local* rise, not
+   just a slow overall drift. A handful of checkpoints only at the two
+   ends of a long unaudited gap cannot distinguish "rose smoothly across
+   the whole gap" from "was flat, then spiked specifically where the
+   reloads cluster, then fell back."
+
+Neither addition is a substitute for §5.6's point below: more checkpoints
+make a trend easier to see, but do not by themselves establish that
+`frac_unstable`'s movement between any two specific checkpoints exceeds
+the statistic's own sampling noise.
 
 ### 5.2 `STIFFNESS_N_BATCHES`
 
@@ -242,7 +383,7 @@ print(sorted(reloads))
 | --- | --- | --- |
 | `DIAG_BATCH_SZ` | Phase 4 (register diagnostics) | sequences per stiffness batch; see the arithmetic in §5.2 |
 | `BLOCK_SIZE` | Cell 0 (global) | tokens per sequence; also feeds directly into §5.2's sample count |
-| `model_cfg.dt` | the checkpoint itself, not a notebook constant | the $\Delta t$ multiplied into every $\omega \Delta t$ sample; using a notebook-level override instead of the checkpoint's own value would silently score a different dynamical system |
+| `model_cfg.dt` | the checkpoint itself, not a notebook constant | the step size multiplied into every `omega * dt` sample; using a notebook-level override instead of the checkpoint's own value would silently score a different dynamical system |
 
 ### 5.5 Constants that are not exposed as parameters (and why)
 
@@ -252,6 +393,84 @@ print(sorted(reloads))
 | Marginal-instability threshold | 1.0 | reports the fraction already past half the bound, an early-warning signal distinct from the pass/fail line |
 | Quantile levels | 0.5, 0.9, 0.99, 0.999 | fixed so results are comparable checkpoint to checkpoint and run to run |
 | Subsampling cap | 4,000,000 | `torch.quantile` has no fast large-N path; the cap only affects the quantile estimate's precision, never `frac_unstable` or `max`, which are always exact over the full tensor |
+
+### 5.6 How many checkpoints does it take to trust a trend?
+
+A run's checkpoints are cheap to add to `STIFFNESS_CKPT_PATHS` but not
+free — each one is a full model rebuild plus `STIFFNESS_N_BATCHES` forward
+passes. It is worth being precise about what an additional checkpoint
+actually buys before spending that time, because the answer depends on
+*which* question is being asked.
+
+**Four points that happen to increase monotonically is weak evidence by
+itself.** For four independent, unordered values there is roughly a
+1-in-12 chance of landing in a purely increasing sequence by chance alone.
+A short run of checkpoints that all move the same direction is suggestive,
+not conclusive — the standard fix is more checkpoints, spread across
+distinct regions of the run (see §5.1's two priorities), so a genuine
+drift becomes much harder to explain away as coincidence than a fold-over
+apparent trend that reverses as soon as one more point is added.
+
+**But sample count within one checkpoint is not the same thing as
+statistical precision.** `harmonic_terms()` can return millions of scalar
+`omega*dt` samples from a single checkpoint (§5.2's arithmetic), which
+makes it tempting to treat `frac_unstable` as measured to several decimal
+places. It is not: those samples are drawn from only
+`STIFFNESS_N_BATCHES` distinct sequences, and within one forward pass they
+are strongly correlated — adjacent token positions in the same sequence
+and adjacent layers along the same evolving `h` trajectory are far from
+independent draws. Treating every scalar as an independent Bernoulli
+trial (the textbook $\sqrt{p(1-p)/n}$ standard error for a proportion)
+plugs in an $n$ that is orders of magnitude too large and reports a
+confidence interval that is correspondingly, and misleadingly, narrow.
+
+`_stiffness_report` accounts for this with a **block bootstrap over
+batches** rather than over individual scalars: each of the
+`STIFFNESS_N_BATCHES` random batches drawn per checkpoint is treated as
+one resampling unit (since a fresh `get_batch()` draw is the closest thing
+to an independent sample this probe has), and `frac_unstable` is
+recomputed 500 times over batches resampled with replacement. The 2.5th
+and 97.5th percentiles of that distribution become
+`frac_unstable_ci95`/`eig_frac_unstable_ci95` in the returned report:
+
+```python
+def _bootstrap_frac_ci(chunks, bounds, mass, dt, threshold,
+                        n_boot=500, seed=0):
+    blocks = [torch.cat(chunks[lo:hi]) for lo, hi in bounds if hi > lo]
+    if len(blocks) < 2:
+        return None
+    wdt_blocks = [(b.clamp(min=0) / mass).sqrt() * dt for b in blocks]
+    counts = np.array([w.numel() for w in wdt_blocks], dtype=np.float64)
+    exceed = np.array([(w > threshold).sum().item() for w in wdt_blocks],
+                       dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    n = len(blocks)
+    boot = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        boot[i] = exceed[idx].sum() / counts[idx].sum()
+    lo_ci, hi_ci = np.percentile(boot, [2.5, 97.5])
+    return float(lo_ci), float(hi_ci)
+```
+
+`bounds` is the list of `(lo, hi)` slice indices into `seen`/`seen_eig`
+contributed by each outer batch, recorded during the forward-pass loop
+(one batch may contribute several `harmonic_terms()` calls, one per
+layer — the slice groups all of them together so the bootstrap resamples
+whole batches, never splits a batch's layers across resamples). Returns
+`None` when there are fewer than two batches to resample over, so a
+`STIFFNESS_N_BATCHES=1` run degrades to reporting a point estimate with no
+CI rather than a spuriously narrow one.
+
+**How to use this in practice:** two checkpoints whose 95% CIs do not
+overlap are good evidence of a genuine change in `frac_unstable` between
+them. A handful of checkpoints whose point estimates drift monotonically
+but whose CIs mostly overlap is a real observation worth reporting, but a
+weaker one — the honest reading is "consistent with a rising trend, not
+yet distinguishable from batch-sampling noise at this
+`STIFFNESS_N_BATCHES`," and the fix is either more checkpoints (§5.1) or a
+larger `STIFFNESS_N_BATCHES` at the checkpoints already being compared,
+not a stronger claim from the same data.
 
 ---
 
@@ -359,7 +578,15 @@ def _stiffness_report(mdl, batches, dt=None):
 
 This is precisely the function §10 proposes moving into SCAF, unchanged in
 substance: it already takes a live model and a list of batches, and never
-imports anything from the paper repo.
+imports anything from the paper repo. Simplified for exposition: the actual
+notebook version also accepts `native=True` (§4.4) to avoid the
+`baoab_cfc`-forcing trajectory substitution, chains a second monkeypatch
+for anisotropic-Gaussian $V_\theta$ with `rank > 0` to also collect the
+Phase 7b Weyl-bound statistic from the same forward passes (see
+[`Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md`](Example_Stiffness_Audit_OWT_g0.1_Anisotropic_Gaussian.md)),
+and attaches a block-bootstrap 95% CI to `frac_unstable`/`eig_frac_unstable`
+(§5.6) so a rising trend across checkpoints can be told apart from
+batch-sampling noise.
 
 ---
 
@@ -373,6 +600,7 @@ imports anything from the paper repo.
 | `max` | the single stiffest position and dimension found in the sampled batches | directly comparable to the pre-clip gradient magnitudes already logged by the watchdog; a `max` above 2 at a step near a logged reload is a direct mechanistic confirmation, not a correlation |
 | `frac_marginal` | fraction of samples with `omega*dt` above 1 | an early-warning fraction; nonzero here well before `frac_unstable` moves is consistent with a slow escalation rather than a sudden onset |
 | `frac_unstable` | fraction of samples with `omega*dt` above 2 | the direct test of the bound in §2; should track the reload rate in `WATCHDOG_RELOAD_STEPS` if the mechanism is real |
+| `frac_unstable_ci95` | 95% CI on `frac_unstable`, block-bootstrapped over batches (§5.6) | `None` guards single-batch runs; otherwise, non-overlapping CIs between two checkpoints are the threshold for calling a change "real" rather than "consistent with sampling noise" |
 
 Two comparisons this enables that a gradient-norm log alone cannot:
 
