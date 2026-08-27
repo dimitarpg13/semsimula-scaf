@@ -160,7 +160,11 @@ def _expand_k(t: torch.Tensor, has_T: bool) -> torch.Tensor:
     return t
 
 
-def weyl_upper_bound(h: torch.Tensor, well_params: dict[str, torch.Tensor]) -> torch.Tensor:
+def weyl_upper_bound(
+    h: torch.Tensor,
+    well_params: dict[str, torch.Tensor],
+    return_sigma_lr: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Aggregate Weyl-inequality upper bound K_Weyl(h) on the true top
     eigenvalue of the effective precision matrix sum_k g_k P_k.
 
@@ -177,9 +181,19 @@ def weyl_upper_bound(h: torch.Tensor, well_params: dict[str, torch.Tensor]) -> t
         h: Hidden states, shape ``(B, T, d)`` or ``(B, d)``.
         well_params: The dict returned by
             :meth:`~scaf.core.adapters.base.ModelAdapter.well_parameters`.
+        return_sigma_lr: when True, also return the raw, un-aggregated,
+            un-``g``-weighted per-well ``sigma_max(B_k)^2`` (shape
+            ``(..., K)``) alongside the usual aggregate bound. This is the
+            quantity `precision_lr_max` caps directly (see companion note
+            ``CfC_BAOAB_Integrator_and_Mitigations.md`` §29.3/§31.3) — the
+            aggregate ``K_Weyl`` mixes it with the diagonal term and the
+            Gaussian-bump weight ``g_k``, which is exactly what makes it
+            unsuitable for choosing a `precision_lr_max` budget directly.
 
     Returns:
-        ``K_Weyl(h)``, shape matching ``h`` minus its last dimension.
+        ``K_Weyl(h)``, shape matching ``h`` minus its last dimension. If
+        ``return_sigma_lr`` is True, returns ``(K_Weyl(h), sigma_max_sq)``
+        instead, with ``sigma_max_sq`` shaped ``(..., K)``.
     """
     mu, a, B, w = (
         well_params["mu"], well_params["precision_diag"],
@@ -207,7 +221,10 @@ def weyl_upper_bound(h: torch.Tensor, well_params: dict[str, torch.Tensor]) -> t
         sigma_max_sq = torch.linalg.eigvalsh(gram)[..., -1]  # (..., K)
 
     per_well = a.max(dim=-1).values + sigma_max_sq  # (..., K)
-    return (g * per_well).sum(dim=-1)  # (...,)
+    k_weyl = (g * per_well).sum(dim=-1)  # (...,)
+    if return_sigma_lr:
+        return k_weyl, sigma_max_sq
+    return k_weyl
 
 
 class StiffnessProbe(Probe):
@@ -278,6 +295,7 @@ class StiffnessProbe(Probe):
         has_weyl = im.caps.has_vtheta_wells
         omega_dt_blocks: list[torch.Tensor] = []
         eig_omega_dt_blocks: list[torch.Tensor] = []
+        sigma_lr_blocks: list[torch.Tensor] = []
         layers_seen: set[int] = set()
 
         with im.deterministic():
@@ -288,6 +306,7 @@ class StiffnessProbe(Probe):
 
                 batch_omega_dt: list[torch.Tensor] = []
                 batch_eig_omega_dt: list[torch.Tensor] = []
+                batch_sigma_lr: list[torch.Tensor] = []
                 for ell in range(len(traj)):
                     h_ell = traj[ell].to(im.device)
                     ht = im.adapter.harmonic_terms(im.model, ell, x, h=h_ell)
@@ -304,15 +323,23 @@ class StiffnessProbe(Probe):
                             im.model, ell, x, h=h_ell
                         )
                         if wp is not None and wp["precision_lr"].shape[-1] > 0:
-                            k_weyl = weyl_upper_bound(h_ell, wp)
+                            k_weyl, sigma_max_sq = weyl_upper_bound(
+                                h_ell, wp, return_sigma_lr=True
+                            )
                             batch_eig_omega_dt.append(
                                 _omega_dt(k_weyl, mass, dt).reshape(-1)
                             )
+                            # Raw, un-aggregated per-well sigma_max(B_k)^2 --
+                            # the quantity `precision_lr_max` caps directly
+                            # (§29.3/§31.3), not yet mixed with a_k or g_k.
+                            batch_sigma_lr.append(sigma_max_sq.reshape(-1))
 
                 if batch_omega_dt:
                     omega_dt_blocks.append(torch.cat(batch_omega_dt))
                 if batch_eig_omega_dt:
                     eig_omega_dt_blocks.append(torch.cat(batch_eig_omega_dt))
+                if batch_sigma_lr:
+                    sigma_lr_blocks.append(torch.cat(batch_sigma_lr))
 
         if not omega_dt_blocks:
             return self._skip(
@@ -360,6 +387,22 @@ class StiffnessProbe(Probe):
                 "eig_max": eig_stats["max"],
                 "eig_frac_unstable": eig_frac_unstable,
                 "eig_frac_unstable_ci95": eig_ci,
+            })
+
+        if sigma_lr_blocks:
+            # Raw sigma_max(B_k)^2 percentiles, in the same units
+            # `precision_lr_max` is specified in -- unlike eig_* above,
+            # these are pre-g-weighting and pre-diagonal-mixing, so they are
+            # the right quantity for bracketing a precision_lr_max budget
+            # between a healthy and a spike-regime checkpoint (§31.4).
+            sigma_lr = torch.cat(sigma_lr_blocks)
+            sigma_lr_stats = _quantiles(sigma_lr)
+            detail.update({
+                "sigma_lr_p50": sigma_lr_stats["median"],
+                "sigma_lr_p90": sigma_lr_stats["p90"],
+                "sigma_lr_p99": sigma_lr_stats["p99"],
+                "sigma_lr_p999": sigma_lr_stats["p999"],
+                "sigma_lr_max": sigma_lr_stats["max"],
             })
 
         return ProbeResult(

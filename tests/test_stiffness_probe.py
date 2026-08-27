@@ -236,3 +236,31 @@ class TestWeylUpperBound:
             h, {"mu": mu, "precision_diag": a, "precision_lr": B, "weights": w}
         )
         assert k_weyl.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_return_sigma_lr_reproduces_planted_spectral_norm(self):
+        # Two wells (K=2), d=3, rank=2. Each well's B is constructed so its
+        # Gram B^T B is already diagonal, making the planted top singular
+        # value exact by inspection: well 0 -> sigma_max^2 = 25, well 1 ->
+        # sigma_max^2 = 9.
+        mu = torch.zeros(2, 3)
+        a = torch.tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+        B = torch.zeros(2, 3, 2)
+        B[0, 0, 0] = 5.0  # well 0, column 0: sigma = 5
+        B[0, 1, 1] = 2.0  # well 0, column 1: sigma = 2 (not the max)
+        B[1, 0, 0] = 3.0  # well 1, column 0: sigma = 3
+        w = torch.tensor([1.0, 1.0])
+        h = torch.zeros(1, 3)  # at both well centres simultaneously
+
+        k_weyl, sigma_max_sq = weyl_upper_bound(
+            h,
+            {"mu": mu, "precision_diag": a, "precision_lr": B, "weights": w},
+            return_sigma_lr=True,
+        )
+        assert sigma_max_sq.shape == (1, 2)
+        assert sigma_max_sq[0, 0].item() == pytest.approx(25.0)
+        assert sigma_max_sq[0, 1].item() == pytest.approx(9.0)
+        # The aggregate bound must be unaffected by asking for sigma_lr too.
+        k_weyl_plain = weyl_upper_bound(
+            h, {"mu": mu, "precision_diag": a, "precision_lr": B, "weights": w}
+        )
+        assert k_weyl.item() == pytest.approx(k_weyl_plain.item())
