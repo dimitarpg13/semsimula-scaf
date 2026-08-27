@@ -85,6 +85,22 @@ def _accepts(fn, param: str) -> bool:
         return False
 
 
+def _has_harmonic_terms(model: nn.Module) -> bool:
+    """Check whether the model's V_theta exposes a harmonic linearisation.
+
+    Purely structural, matching ``_has_gaussian_wells``: any ``V_theta``
+    that defines its own ``harmonic_terms`` method qualifies, whether it is
+    a Gaussian-mixture bank (``AnisotropicDepthConditionedGaussianVTheta``
+    and friends) or a structured quadratic well
+    (``QuadraticWellVTheta``/``MixtureQuadraticVTheta``/...). Also true for
+    toy models that expose ``harmonic_terms`` directly.
+    """
+    vtheta = getattr(model, "V_theta", None)
+    if vtheta is None:
+        return hasattr(model, "harmonic_terms")
+    return callable(getattr(vtheta, "harmonic_terms", None))
+
+
 def _has_gaussian_wells(model: nn.Module) -> bool:
     """Check whether the model's V_theta exposes Gaussian well parameters.
 
@@ -235,6 +251,7 @@ class FockAdapter(ModelAdapter):
             )
         )
         has_wells = _has_gaussian_wells(model)
+        has_harmonic = _has_harmonic_terms(model)
 
         return Capabilities(
             requires_grad_forward=True,
@@ -244,6 +261,7 @@ class FockAdapter(ModelAdapter):
             has_attention=getattr(model, "attn_blocks", None) is not None,
             has_hidden_states=has_trajectory,
             has_vtheta_wells=has_wells,
+            has_harmonic_terms=has_harmonic,
             mediators=tuple(mediators),
             causal_flags=flags,
             notes=tuple(notes),
@@ -431,6 +449,94 @@ class FockAdapter(ModelAdapter):
             "precision_lr": B.detach(),
             "weights": w.detach(),
         }
+
+    # ------------------------------------------------------------------
+    def harmonic_terms(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return ``(k_diag, s)`` from the model's own ``harmonic_terms``.
+
+        Every Gaussian-mixture and structured-quadratic ``V_theta`` variant
+        implements ``harmonic_terms(xi, h)`` itself (see
+        ``model_aniso_gaussian_vtheta.py`` / ``model_gaussian_vtheta.py`` /
+        ``model_structured_vtheta.py`` in the paper repo), including its own
+        aggregation across multiple context channels where that applies
+        (``AnisotropicDepthConditionedGaussianVTheta.harmonic_terms`` already
+        sums over per-channel banks and applies the depth-code shift
+        internally). This method's job is therefore limited to deriving the
+        same ``xi`` :meth:`well_parameters` derives and calling straight
+        through — no curvature math is reimplemented here.
+
+        Falls back to reconstructing the trajectory from ``x`` when ``h`` is
+        omitted, exactly like :meth:`well_parameters`.
+
+        Returns ``None`` if the model has no ``harmonic_terms`` method, if
+        ``layer_idx`` addresses no layer, or if the model's own
+        ``xi_module(h)`` output is not shaped the way this particular
+        ``V_theta``'s ``harmonic_terms`` expects (for example, a structured
+        quadratic well embedded in a multi-context stack without a
+        multi-context-aware wrapper around it — bridging that shape gap is
+        model-specific glue that belongs in the caller, not in a
+        general-purpose adapter).
+        """
+        if hasattr(model, "harmonic_terms"):
+            return model.harmonic_terms(layer_idx, x, h=h)
+
+        vtheta = getattr(model, "V_theta", None)
+        if vtheta is None or not callable(getattr(vtheta, "harmonic_terms", None)):
+            return None
+
+        xi_mod = getattr(model, "xi_module", None)
+        if xi_mod is None:
+            return None
+
+        n_layers = getattr(vtheta, "n_layers", None)
+        if n_layers is not None and not 0 <= layer_idx < n_layers:
+            return None
+
+        if h is None:
+            _, traj = self.forward_with_trajectory(model, x)
+            if layer_idx >= len(traj):
+                return None
+            h = traj[layer_idx]
+
+        ref = next(model.parameters(), None)
+        if ref is not None:
+            h = h.to(device=ref.device, dtype=ref.dtype)
+
+        with torch.no_grad():
+            xi = xi_mod(h)
+
+        if hasattr(vtheta, "set_active_layer"):
+            vtheta.set_active_layer(layer_idx)
+
+        try:
+            k_diag, s = vtheta.harmonic_terms(xi, h)
+        except (RuntimeError, TypeError, ValueError):
+            # xi/h shape mismatch: this V_theta's harmonic_terms does not
+            # accept whatever shape xi_module(h) produces (e.g. a
+            # single-context structured quadratic well fed a multi-context
+            # xi with no built-in aggregation). Fail closed rather than
+            # guess at a reshape.
+            return None
+
+        return k_diag.detach(), s.detach()
+
+    def mass(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
+        """Return the per-position mass from ``model.compute_mass(x)``.
+
+        ``None`` if the model has no such method (a mass-free architecture,
+        or a family not built on ``model_parf.py``'s PARF base).
+        """
+        compute_mass = getattr(model, "compute_mass", None)
+        if not callable(compute_mass):
+            return None
+        with torch.no_grad():
+            return compute_mass(x).detach()
 
     # ------------------------------------------------------------------
     def forward_with_trajectory(

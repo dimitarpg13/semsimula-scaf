@@ -36,6 +36,7 @@ __all__ = [
     "TwoChannelLeakToyLM",
     "GaussianWellCausalToyLM",
     "GaussianWellLeakyToyLM",
+    "HarmonicToyLM",
 ]
 
 
@@ -47,6 +48,8 @@ class ToyConfig:
     max_len: int = 64
     causal_force: bool = False
     prefix_causal_registers: bool = True
+    #: Step size, read by StiffnessProbe via ModelAdapter.config()['dt'].
+    dt: float = 1.0
 
 
 class _ToyBase(nn.Module):
@@ -350,3 +353,44 @@ class GaussianWellLeakyToyLM(_GaussianWellMixin, _ToyBase):
         global_pool = h.mean(dim=1, keepdim=True)
         h_out = self._prefix_mean(h) + self.leak_scale * global_pool
         return self.out(h_out), [h, h_out]
+
+
+# ======================================================================
+# Tier C toy — a model with an explicit, hand-known harmonic curvature
+# ======================================================================
+
+class HarmonicToyLM(_ToyBase):
+    """Causal toy with a fixed, hand-known ``harmonic_terms()`` curvature.
+
+    ``k_diag`` is a single constant, not state- or context-dependent, so
+    ``StiffnessProbe``'s ``omega*dt`` is exactly
+    ``sqrt(k_diag_value) * cfg.dt`` at *every* sampled position — letting
+    probe tests assert on a precise number instead of a fuzzy inequality,
+    the same role ``GaussianWellCausalToyLM``'s fixed wells play for
+    ``BasinMembershipProbe``.
+
+    No ``compute_mass`` is defined, so ``ModelAdapter.mass()`` returns
+    ``None`` and ``StiffnessProbe`` treats mass as ``1`` — one fewer moving
+    part to account for when hand-computing the expected statistic.
+    """
+
+    def __init__(self, cfg: ToyConfig | None = None, k_diag_value: float = 1.0):
+        super().__init__(cfg)
+        self.k_diag_value = float(k_diag_value)
+
+    def forward(self, x):
+        h = self.emb(x)
+        return self.out(self._prefix_mean(h)), None
+
+    def forward_with_trajectory(self, x):
+        h = self.emb(x)
+        h_out = self._prefix_mean(h)
+        return self.out(h_out), [h, h_out]
+
+    def harmonic_terms(self, layer_idx: int, x: torch.Tensor, h=None):
+        if h is None:
+            _, traj = self.forward_with_trajectory(x)
+            h = traj[layer_idx]
+        k_diag = torch.full_like(h, self.k_diag_value)
+        s = torch.zeros_like(h)
+        return k_diag, s
