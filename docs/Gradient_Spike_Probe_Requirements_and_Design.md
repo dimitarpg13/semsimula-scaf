@@ -18,7 +18,9 @@ and group-agnostic),
 contract this design extends with two small additions, §5.2),
 [`CfC_BAOAB_Integrator_and_Mitigations.md` §33](https://github.com/dimitarpg13/semsimula-paper/blob/main/companion_notes/CfC_BAOAB_Integrator_and_Mitigations.md)
 (the empirical result that motivated this probe: the `precision_lr_max`
-bracket came back flat, so the spikes are not a $V_\theta$-curvature problem).
+bracket came back modestly and non-monotonically elevated but far too small
+in magnitude to explain the spikes, so they are not primarily a
+$V_\theta$-curvature problem).
 
 ---
 
@@ -60,17 +62,25 @@ Three tools already exist and each stops short of attribution:
    $\omega \Delta t$ from the $V_\theta$ harmonic linearisation and the
    `sigma_lr_*` percentiles of $\sigma_{\max}(B_k)^2$. That is exactly the
    right tool when the suspect is $V_\theta$ curvature — but on the live L=8
-   `baoab_cfc` d=384 run it returned a **negative** result:
+   `baoab_cfc` d=384 run it returned a **negative** result for $B_k$ as the
+   *primary* driver:
 
-> The `precision_lr_max` bracket pair (healthy step-27,000 checkpoint vs.
-> step-34,091 spike-regime prereload) came back within +8% at every
-> percentile. $B_k$ growth is not the driver of these bursts; the spikes
-> live in the non-$V_\theta$ groups. (CfC/BAOAB companion note §33.1.)
+> The `precision_lr_max` bracket (healthy step-27,000 checkpoint vs. both
+> spike-regime prereload snapshots, step 32,139 and step 34,091) came back
+> +1% to +24% above healthy at every percentile — real and repeatable, but
+> non-monotonic between the two triggers (32,139 is *more* elevated than
+> 34,091, despite firing first) and far too small to explain pre-clip
+> grad-norms of 701.1 and 5,864.9 (both an order of magnitude or more above
+> the `GRAD_NORM_HARD_TRIGGER=500.0` threshold) via a $\lesssim 1.1\times$
+> frequency effect. $B_k$ growth is at most a weak correlate, not the
+> driver, of these bursts; the spikes live in the non-$V_\theta$ groups.
+> (CfC/BAOAB companion note §33.1.)
 
-<p align="center"><img src="images/scaf_spike_diag_sigma_lr_bracket_result.png" alt="Grouped bar chart on a log y-axis comparing sigma_max(B_k)^2 percentiles between a healthy step-27000 checkpoint and a spike-regime step-34091 prereload snapshot, showing the two distributions differ by at most eight percent across p50 through max, with an annotation concluding that B_k growth is not the driver of the bursts" width="720"></p>
+<p align="center"><img src="images/scaf_spike_diag_sigma_lr_bracket_result.png" alt="Grouped bar chart on a log y-axis comparing sigma_max(B_k)^2 percentiles between a healthy step-27000 checkpoint and two spike-regime prereload snapshots (step 32139 and step 34091), showing both spike checkpoints modestly and non-monotonically elevated above healthy across p50 through max, with an annotation concluding that B_k is at most a weak correlate, not the driver, of the bursts" width="720"></p>
 
-That flat result is the motivation for this probe. `StiffnessProbe` could rule
-$V_\theta$ *out*; nothing in SCAF can currently point at what is *in*. The
+That modest-but-non-escalating result is the motivation for this probe.
+`StiffnessProbe` could rule $V_\theta$ *out* as the primary driver; nothing
+in SCAF can currently point at what is *in*. The
 crucial fact `StiffnessProbe` also surfaces — that $B_k$ is context-dependent,
 so a static weight inspection undersells what the *actual* offending batch
 does — is exactly why this probe is built around a captured batch and a real
@@ -159,7 +169,8 @@ model's `.grad` state exactly as it found it.
 
 The captured-batch path is the point of the probe. A corpus sample reproduces
 the §2 limitation (it measures the weights' *typical* behaviour, which for
-$B_k$ was flat); the offending batch reproduces the *event*.
+$B_k$ was only modestly and non-monotonically elevated); the offending batch
+reproduces the *event*.
 
 ### 5.2 Adapter contract additions
 

@@ -9,9 +9,13 @@ Three figures, used by:
 Figure 1 (scaf_spike_diag_sigma_lr_bracket_result.png)
     REAL DATA. The measured sigma_max(B_k)^2 percentiles from the live L=8
     baoab_cfc d=384 run: a healthy checkpoint (step 27,000, best, PPL 100.47)
-    vs. a spike-regime prereload snapshot (step 34,091, hard-watchdog trigger).
-    The two distributions are within +8% at every percentile -> B_k growth is
-    NOT the driver of these bursts (companion note §31.4 step 1, §33).
+    vs. both spike-regime prereload snapshots (step 32,139 and step 34,091,
+    the two hard-watchdog triggers). Both spike snapshots sit modestly above
+    healthy (roughly +3% to +24%, non-monotonically -- 32,139 is the MORE
+    elevated of the two despite firing first), but nowhere near the >100x
+    scale of the observed grad-norm spikes -> B_k is at most a weak
+    correlate, not the driver, of these bursts (companion note §31.4 step 1,
+    §33).
 
 Figure 2 (scaf_spike_diag_forward_backward_map.png)
     SCHEMATIC. The Fock-PARFLM forward integrator, the parameter groups that
@@ -50,17 +54,21 @@ C_DARK = "#2c3e50"
 def fig_bracket_result(out="scaf_spike_diag_sigma_lr_bracket_result.png"):
     labels = ["p50", "p90", "p99", "p99.9", "max"]
     healthy = [282.11, 663.61, 1047.00, 2322.33, 6364.81]
-    spike = [305.59, 700.53, 1082.80, 2499.07, 6427.16]
-    deltas = [100.0 * (s - h) / h for h, s in zip(healthy, spike)]
+    s32139 = [350.07, 758.32, 1145.95, 2514.92, 7285.88]
+    s34091 = [305.59, 700.53, 1082.80, 2499.07, 6427.16]
+    d32139 = [100.0 * (s - h) / h for h, s in zip(healthy, s32139)]
+    d34091 = [100.0 * (s - h) / h for h, s in zip(healthy, s34091)]
 
     x = np.arange(len(labels))
-    w = 0.38
+    w = 0.27
 
-    fig, ax = plt.subplots(figsize=(9.6, 5.4))
-    b1 = ax.bar(x - w / 2, healthy, w, color=C_BLUE,
-                label="healthy — step 27,000 best (PPL 100.47)")
-    b2 = ax.bar(x + w / 2, spike, w, color=C_RED,
-                label="spike-regime — step 34,091 prereload (hard trigger)")
+    fig, ax = plt.subplots(figsize=(10.4, 5.6))
+    ax.bar(x - w, healthy, w, color=C_BLUE,
+           label="healthy — step 27,000 best (PPL 100.47)")
+    ax.bar(x, s32139, w, color=C_ORANGE,
+           label="spike-regime — step 32,139 prereload (1st hard trigger)")
+    ax.bar(x + w, s34091, w, color=C_RED,
+           label="spike-regime — step 34,091 prereload (2nd hard trigger)")
 
     ax.set_yscale("log")
     ax.set_ylabel(r"$\sigma_{\max}(B_k)^2$  (per well, per xi-channel, per layer)")
@@ -68,27 +76,32 @@ def fig_bracket_result(out="scaf_spike_diag_sigma_lr_bracket_result.png"):
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_title(
-        "The low-rank curvature barely moves into the crisis\n"
+        "The low-rank curvature is elevated at both crises, but far short of\n"
+        "the >100x grad-norm spike scale, and non-monotonically between them\n"
         "L=8  baoab_cfc  d=384  aniso-Gaussian $V_\\theta$  (fixed seed-0 probe batch)"
     )
-    ax.set_ylim(100, 12000)
+    ax.set_ylim(100, 15000)
 
-    for xi, h, s, d in zip(x, healthy, spike, deltas):
-        top = max(h, s)
-        ax.annotate(f"+{d:.1f}%", xy=(xi, top), xytext=(0, 8),
+    for xi, dv, sv in zip(x, d32139, s32139):
+        ax.annotate(f"+{dv:.0f}%", xy=(xi, sv), xytext=(0, 6),
                     textcoords="offset points", ha="center", va="bottom",
-                    fontsize=9, color=C_DARK, fontweight="bold")
+                    fontsize=8.3, color=C_ORANGE, fontweight="bold")
+    for xi, dv, sv in zip(x, d34091, s34091):
+        ax.annotate(f"+{dv:.0f}%", xy=(xi + w, sv), xytext=(0, 6),
+                    textcoords="offset points", ha="center", va="bottom",
+                    fontsize=8.3, color=C_RED, fontweight="bold")
 
     ax.text(
         0.015, 0.97,
-        "All percentiles within +8% -> $B_k$ growth is NOT the driver\n"
-        "of these bursts (companion note §31.4 step 1, §33).\n"
-        "precision_lr_max is the wrong lever; look at the\n"
-        "non-$V_\\theta$ groups instead.",
-        transform=ax.transAxes, ha="left", va="top", fontsize=9.5,
+        "Both crises sit +3% to +24% above healthy, non-monotonically\n"
+        "(32,139 > 34,091 despite firing first) -> at most a weak\n"
+        "correlate, not the driver, of the >100x grad-norm spikes\n"
+        "(companion §31.4 step 1, §33). precision_lr_max is the wrong\n"
+        "primary lever; look at the non-$V_\\theta$ groups instead.",
+        transform=ax.transAxes, ha="left", va="top", fontsize=9.0,
         bbox=dict(boxstyle="round,pad=0.5", fc="#fdf6e3", ec=C_ORANGE, lw=1.3),
     )
-    ax.legend(loc="lower right", fontsize=9)
+    ax.legend(loc="lower right", fontsize=8.4)
     ax.grid(axis="y", alpha=0.25, which="both")
     fig.tight_layout()
     fig.savefig(out, dpi=150)
