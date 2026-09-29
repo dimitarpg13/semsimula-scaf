@@ -365,6 +365,76 @@ def check_mermaid(path: str, seg) -> list[Finding]:
     return f
 
 
+# ---------------------------------------------------------------------------
+# Part III — entity placement
+# ---------------------------------------------------------------------------
+
+#: entities the cheatsheet endorses for Mermaid labels (§14, §18), which are
+#: exactly the ones most likely to be carried into prose by mistake.
+_ENTITY = re.compile(r"&#\d+;|&[A-Za-z][A-Za-z0-9]{1,9};")
+_CODE_SPAN = re.compile(r"`+[^`]*`+")
+
+
+def _quotes_markup(span: str) -> bool:
+    """Is this code span *showing* markup rather than naming an identifier?
+
+    Three forms are legitimate and must not fire, all of which appear in the
+    cheatsheet's own §14/§18/§18a entries:
+
+    * ``` ``...`` ``` — two or more backticks is the conventional way to quote
+      a single-backtick construct verbatim, so the author is demonstrating.
+    * a span whose entire content is one entity, e.g. ``&#95;`` — naming the
+      entity itself, which any document explaining the rule must do.
+    * a span containing Mermaid node-label syntax (``["`` or ``"]``) — there
+      the entity is *required* by §14/§18, and the span is quoting source.
+    """
+    body = span.strip("`")
+    if span.startswith("``"):
+        return True
+    if _ENTITY.fullmatch(body.strip()):
+        return True
+    return '["' in body or '"]' in body
+
+
+def check_entities(path: str, seg) -> list[Finding]:
+    """§18a — HTML entities stranded inside Markdown code spans.
+
+    Markdown does not decode entities between backticks, so ``a&#95;b``
+    renders as the seven literal characters rather than ``a_b``. The entity
+    trick belongs to **Mermaid node labels** (§14, §18), where decoding
+    happens after Mermaid's lexer has run; inside a code span the character
+    is already literal and needs no escaping at all.
+
+    Found 2026-09-24 in a hand-written table that rendered as
+    ``WSD&#95;STABLE&#95;FRAC`` across ten rows, and again the following day
+    in a second document. Both had copied the §18 Mermaid rule into prose.
+    Mermaid blocks are exempt: there the entity is correct.
+    """
+    findings: list[Finding] = []
+    for kind, start, lines in seg:
+        if kind != "prose":
+            continue
+        for offset, line in enumerate(lines):
+            for span in _CODE_SPAN.finditer(line):
+                text = span.group()
+                hit = _ENTITY.search(text)
+                if hit is None or _quotes_markup(text):
+                    continue
+                findings.append(
+                    Finding(
+                        path,
+                        start + offset,
+                        "§18a",
+                        FATAL,
+                        f"HTML entity {hit.group()} inside a code span renders "
+                        f"literally; inside backticks the character is already "
+                        f"literal, so write it directly",
+                        line.strip(),
+                    )
+                )
+    return findings
+
+
 RULES = {
     "§1": "spacing commands render as punctuation",
     "§2": "\\operatorname is blocked",
@@ -385,6 +455,7 @@ RULES = {
     "§16": 'subgraph ID ["Title"]',
     "§17": "inline dotted-edge labels",
     "§18": "Mermaid label cautionary cleanups",
+    "§18a": "HTML entity inside a Markdown code span",
     "§19": "\\left/\\middle/\\right constructs",
     "§20": "advanced Mermaid node shapes",
     "§21": "'--' in unquoted node labels",
@@ -394,10 +465,30 @@ RULES = {
 }
 
 
+#: ``<!-- lint-disable §18a -->`` anywhere in a file suppresses that rule for
+#: the whole file. Deliberately file-level and deliberately loud: the only
+#: documents that should need it are ones *about* the rule, and a reader
+#: scanning for why a check is quiet will find the directive.
+_DISABLE = re.compile(r"<!--\s*lint-disable\s+([^>]+?)\s*-->")
+
+
+def _disabled_rules(text: str) -> set[str]:
+    out: set[str] = set()
+    for m in _DISABLE.finditer(text):
+        out.update(tok.strip() for tok in m.group(1).replace(",", " ").split())
+    return out
+
+
 def lint(path: Path) -> list[Finding]:
     text = path.read_text(encoding="utf-8")
     seg = _segment(text)
-    return check_katex(str(path), seg) + check_mermaid(str(path), seg)
+    findings = (
+        check_katex(str(path), seg)
+        + check_mermaid(str(path), seg)
+        + check_entities(str(path), seg)
+    )
+    off = _disabled_rules(text)
+    return [f for f in findings if f.rule not in off] if off else findings
 
 
 def main(argv: list[str] | None = None) -> int:
