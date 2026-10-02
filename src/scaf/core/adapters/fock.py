@@ -104,7 +104,8 @@ def _has_harmonic_terms(model: nn.Module) -> bool:
 def _has_gaussian_wells(model: nn.Module) -> bool:
     """Check whether the model's V_theta exposes Gaussian well parameters.
 
-    True for models using ``AnisotropicDepthConditionedGaussianVTheta`` or
+    True for models using ``AnisotropicDepthConditionedGaussianVTheta`` (with
+    either ``coupling='additive'`` or ``coupling='joint'``) or
     ``AnisotropicMultiContextGaussianVTheta`` — detected structurally via
     ``_components`` and ``mu_proj``.  Also true for toy models that expose
     ``well_parameters`` directly.
@@ -423,7 +424,17 @@ class FockAdapter(ModelAdapter):
 
         # Reach the actual Gaussian bank that has _components
         bank = getattr(vtheta, "bank", vtheta)
-        if hasattr(bank, "banks"):
+        if hasattr(bank, "_flatten") and hasattr(bank, "banks") and len(bank.banks) == 1:
+            # Joint coupling (``JointContextAnisotropicGaussianVTheta``): ONE
+            # bank whose projections read the concatenated context
+            # ``(..., n_ctx * d)``. The per-head slice below would hand it a
+            # single channel's ``d`` columns and raise a shape error, which the
+            # monitor's try/except then swallowed -- Tier B silently never ran
+            # on any joint-bank (``vtjoint``) checkpoint until this branch.
+            mu, a, w, B = _unpack_components(
+                bank.banks[0], bank._flatten(xi_shifted)  # noqa: SLF001
+            )
+        elif hasattr(bank, "banks"):
             # MultiContext: extract from each head and concatenate
             heads = bank.banks
             all_mu, all_a, all_w, all_B = [], [], [], []

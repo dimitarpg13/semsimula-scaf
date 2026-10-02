@@ -541,3 +541,67 @@ def test_leak_frame_without_basin_membership_unchanged():
     )
     assert "basin_changed" not in frame.columns
     assert "well_id_factual" not in frame.columns
+
+
+# ---------------------------------------------------------------------------
+# Joint coupling: one bank over the concatenated context (``vtjoint`` ladder)
+# ---------------------------------------------------------------------------
+class _IsoJointBank(nn.Module):
+    """Stand-in for ``JointContextAnisotropicGaussianVTheta``.
+
+    ONE bank whose projections read the concatenated context ``(..., n_ctx*d)``,
+    wrapped in a length-1 ``banks`` list and exposing ``_flatten`` -- the two
+    structural markers the adapter's joint branch keys on.
+    """
+
+    def __init__(self, d: int, K: int, n_ctx: int):
+        super().__init__()
+        self.d, self.K, self.n_ctx = d, K, n_ctx
+        inner = _IsoBank(d, K)
+        inner.mu_proj = nn.Linear(n_ctx * d, K * d)
+        inner.a_proj = nn.Linear(n_ctx * d, K * d)
+        inner.w_proj = nn.Linear(n_ctx * d, K)
+        self.banks = nn.ModuleList([inner])
+
+    def _flatten(self, xis):
+        return xis.reshape(*xis.shape[:-2], self.n_ctx * self.d)
+
+
+class _IsoDepthConditionedJoint(_IsoDepthConditioned):
+    def __init__(self, d: int, K: int, n_ctx: int, n_layers: int):
+        super().__init__(d, K, n_ctx, n_layers)
+        self.bank = _IsoJointBank(d, K, n_ctx)
+        self.coupling = "joint"
+
+
+class TestJointBankWellParameters:
+    """Regression: on a joint bank the per-head slice handed a single channel's
+    ``d`` columns to a projection expecting ``n_ctx*d``. The resulting shape
+    error was swallowed by ``LeakMonitor``'s try/except, so Tier B silently
+    never ran on any ``vtjoint`` ladder checkpoint (found 2026-10-02)."""
+
+    def _model(self):
+        model = _IsoFockModel(d=8, K=2, n_ctx=2, n_layers=2)
+        model.V_theta = _IsoDepthConditionedJoint(8, 2, 2, 2)
+        return model
+
+    def test_has_gaussian_wells_detects_joint_bank(self):
+        assert fock_adapter_module._has_gaussian_wells(self._model())
+
+    def test_well_parameters_on_joint_bank_returns_K_wells(self):
+        model = self._model()
+        adapter = scaf.FockAdapter()
+        x = torch.randint(0, 24, (2, 6))
+        h = torch.randn(2, 6, 8)
+        wp = adapter.well_parameters(model, 0, x, h=h)   # raised before the fix
+        assert wp is not None
+        assert wp["mu"].shape == (2, 6, 2, 8), "K wells, not n_ctx*K"
+        assert wp["precision_diag"].shape == (2, 6, 2, 8)
+        assert wp["weights"].shape == (2, 6, 2)
+
+    def test_additive_path_unchanged(self):
+        model = _IsoFockModel(d=8, K=2, n_ctx=2, n_layers=2)
+        wp = scaf.FockAdapter().well_parameters(
+            model, 0, torch.randint(0, 24, (2, 6)), h=torch.randn(2, 6, 8))
+        assert wp["mu"].shape == (2, 6, 4, 8), "additive: n_ctx*K wells"
+
