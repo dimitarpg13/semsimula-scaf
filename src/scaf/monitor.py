@@ -341,6 +341,12 @@ class LeakMonitor:
                 ).run(im, self.corpus)
             ]
             diagnostics = []
+            # A geometric probe must not crash the monitor, but a failure
+            # must not read as a clean result either: the record carries the
+            # exception, and the absence of the probe's fields is thereby
+            # distinguishable from a measured zero. (Tier B raised a shape
+            # error on every joint-bank checkpoint for a month, unseen.)
+            probe_errors: dict[str, str] = {}
             if self.hidden_state_probe and im.caps.has_hidden_states:
                 try:
                     diagnostics.append(
@@ -352,8 +358,8 @@ class LeakMonitor:
                             micro_batch=self.micro_batch,
                         ).run(im, self.corpus)
                     )
-                except Exception:  # noqa: BLE001 - geometric probe must not crash the monitor
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    probe_errors["hidden_state_error"] = f"{type(exc).__name__}: {exc}"[:300]
             if self.basin_membership_probe and im.caps.has_vtheta_wells:
                 try:
                     diagnostics.append(
@@ -364,8 +370,8 @@ class LeakMonitor:
                             micro_batch=self.micro_batch,
                         ).run(im, self.corpus)
                     )
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    probe_errors["basin_membership_error"] = f"{type(exc).__name__}: {exc}"[:300]
             if want_honest:
                 probes.append(
                     TargetRelocationProbe(
@@ -424,6 +430,7 @@ class LeakMonitor:
             record["placebo"] = controls[1].statistic
             record["positive_control"] = controls[2].statistic
             record["controls_ok"] = card.controls_ok
+        record.update(probe_errors)
         if hs is not None and not hs.skipped:
             record["max_cos_dev"] = hs.statistic
             record["peak_layer"] = hs.detail.get("peak_layer")
