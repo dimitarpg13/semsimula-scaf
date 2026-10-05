@@ -15,12 +15,14 @@ deviation:
       = 1 - \\cos\\bigl(h_\\ell^{(t)}[\\text{factual}],\\,
                          h_\\ell^{(t)}[\\text{counterfactual}]\\bigr)
 
-Why cosine, not L2: the SemSimula hidden-state space carries a Jacobi metric
-that is conformally flat — :math:`\\tilde g = \\Omega^2 g`. Under any conformal
-rescaling the :math:`\\Omega` factors cancel in the cosine ratio, so cosine
-deviation is the same quantity whether measured in flat coordinates or in the
-model's curved Riemannian geometry. L2 distance would conflate leak magnitude
-with the local potential energy.
+Why cosine: with ``ln_after_step`` every layer's output lies on the LayerNorm
+sphere (radius about sqrt(d)), so position is carried by direction and the
+angle between the factual and counterfactual states is the natural comparison.
+It is also exact for detection: under strict causality the two states are
+bit-identical, so the deviation is exactly 0. (Conformal invariance of the
+Jacobi metric concerns tangent vectors at one point, not two positions, so it
+is not the justification here. See docs/Geometric_Distance_Metrics_for_SCAF.md,
+SS2.2 and Tier A.)
 
 Why it matters beyond logit L∞: a hidden-state leak that hasn't yet
 propagated to logits — e.g. register states carrying future information that a

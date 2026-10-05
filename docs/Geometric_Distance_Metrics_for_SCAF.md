@@ -1,10 +1,21 @@
 # Geometric Distance Metrics for SCAF
 
 **Status:** Design note — proposed extension to the SemSimula Causal Auditing Framework.  
-**Date:** August 2026  
+**Date:** August 2026; scope corrected 2026-10-05 (see the box below)  
 **Prerequisites:** [Framework_for_Causal_Analysis_SemSimula_Models.md](Framework_for_Causal_Analysis_SemSimula_Models.md), [Exploiting_the_Riemannian_geometry_of_conservative_language_models.md](https://github.com/dimitarpg13/semsimula-paper/blob/main/companion_notes/Exploiting_the_Riemannian_geometry_of_conservative_language_models.md), [Geodesic_Preservation_Experiment.md](https://github.com/dimitarpg13/semsimula-paper/blob/main/companion_notes/Geodesic_Preservation_Experiment.md)
 
 ---
+
+> **Scope (revised 2026-10-05).** This note uses the Jacobi metric induced by the learned potential $V_\theta$ as a **ruler** on hidden-state space. Measuring distances with a metric does not require the model's trajectories to follow that metric's geodesics, and in the Fock models they do not.
+>
+> - Book v6 (§27.14) establishes that only the conservative-only model takes exact damped geodesic steps, and only at the trained step size.
+> - In the Fock models the register (reverse-channel) increment is 1.5–3.9 times the conservative step on every token. Their trajectories are forced, not geodesic, and the reverse channel does not enter the Jacobi metric at all.
+>
+> What follows depends on that distinction:
+> - **Tier A** (hidden-state cosine) and **Tier B** (basin membership) do not depend on geodesics and apply to every model with a Gaussian $V_\theta$.
+> - **Tier C** (the asymmetric damped-path measure) is defined only for conservative models. Its interpretation is an uncalibrated hypothesis, and it is **not implemented**.
+>
+> Earlier wording that called the Tier C quantity "the true Riemannian distance", or justified Tier A by conformal invariance, has been corrected below.
 
 ## 1. Motivation
 
@@ -23,8 +34,8 @@ The Semantic Simulation framework equips the hidden-state space with a **Riemann
 
 1. **Pre-logit leak detection.** Hidden-state corruption that hasn't yet manifested at the output (e.g., register states carrying future information that haven't been decoded).
 2. **Qualitative leak characterisation.** Continuous perturbation (small cosine deviation, same basin) vs. basin-crossing (different attractor well assignment) vs. trajectory derailment (large geodesic distance).
-3. **Physically meaningful leak sizing.** The geodesic distance $d_{\text{geo}}(h_{\text{factual}} \to h_{\text{counterfactual}})$ measures "how far the leak moved the trajectory" in the model's own geometry, not in an arbitrary coordinate system.
-4. **Leak-direction analysis.** The asymmetry ratio $d_{\text{geo}}(h_f \to h_c) / d_{\text{geo}}(h_c \to h_f)$ distinguishes leaks that propagate through the model's natural dynamics (ratio $\approx 1.35$–$1.40$, matching the architecture's measured asymmetry) from wiring-level bypasses (ratio $\approx 1.0$, short-circuiting the dynamics entirely).
+3. **Leak sizing in the $V_\theta$ geometry** (conservative models). The damped-path measure $d_{\text{geo}}(h_{\text{factual}} \to h_{\text{counterfactual}})$ sizes the leak in the metric the learned potential induces, rather than in raw coordinates.
+4. **Leak-direction analysis** (a hypothesis, not yet calibrated). The ratio $d_{\text{geo}}(h_f \to h_c) / d_{\text{geo}}(h_c \to h_f)$ might separate leaks that ride the conservative dynamics from wiring-level bypasses. The 1.35–1.40 asymmetry this would be compared with was measured on SPLM-family models (Diagnostic Battery Arm 5), not on Fock models, whose reverse channel lies outside the metric (§3, Tier C).
 
 ---
 
@@ -42,6 +53,11 @@ $$\Omega_\ell^2 = 2 T_\ell \cdot m = m^2 \lVert\dot h_\ell\rVert^2$$
 
 confirmed positive at 100% of positions by Diagnostic Battery Arm 1.
 
+**What this metric is, and what it is not.**
+- $\tilde g$ is induced by $V_\theta$ alone. It is a legitimate ruler on hidden-state space for every model that has a $V_\theta$, including the Fock models.
+- It describes the models' **trajectories** as geodesics only where the dynamics is conservative. That holds for the conservative-only model at the trained step size, and does not hold for the Fock models, whose non-conservative register increment exceeds the conservative step.
+- The damped, layer-dependent factor $\Omega_\ell^2 = m^2\lVert\dot h_\ell\rVert^2$ is evaluated on a trajectory. It is a path-attached quantity, not a fixed metric on the space.
+
 ### 2.2 Why cosine similarity is the conformally correct angular metric
 
 For any conformal rescaling $\tilde g = \Omega^2 g$, the inner product and norms rescale as $\langle u,v\rangle_{\tilde g} = \Omega^2 \langle u,v\rangle_g$ and $\lVert u\rVert_{\tilde g} = \Omega\lVert u\rVert_g$. Therefore:
@@ -50,11 +66,13 @@ $$\cos_{\tilde g}(u,v) = \frac{\Omega^2 \langle u,v\rangle_g}{\Omega\lVert u\rVe
 
 The $\Omega$ factors cancel exactly. This is proven as Proposition `stp-conformal-invariance` in paper v5 §18. **Cosine similarity yields the same value in flat coordinates and in the curved Jacobi metric** — it is the unique angular metric that doesn't depend on where you are in the potential landscape.
 
-Conversely, Euclidean/L2 distance $\lVert u\rVert_{\tilde g} = \Omega(h)\lVert u\rVert_g$ depends on the local conformal factor. Two identical coordinate displacements at different positions in the potential map to different physical distances. **Raw L2 is not a well-defined geometric quantity in this space.**
+Conversely, the length of a displacement, $\lVert u\rVert_{\tilde g} = \Omega(h)\lVert u\rVert_g$, depends on the local conformal factor: the same coordinate displacement at two places has different lengths in $\tilde g$.
+
+**Scope of this result.** Conformal invariance concerns the angle between two **tangent vectors at the same point**. It does not apply to the cosine between two **positions**, $h_{\text{factual}}$ and $h_{\text{counterfactual}}$, which is what Tier A computes. Tier A's justification is therefore different, and is given in §3. Raw L2 remains a valid flat-space detector; it is simply not a $\tilde g$ length.
 
 ### 2.3 Geodesic distance and its inherent asymmetry
 
-The true Riemannian distance between two hidden states is the arc length along the connecting geodesic:
+A Riemannian distance is symmetric by definition. The quantity defined here is **not** one: it is the length of the connecting **damped** path, a direction-dependent action cost (a quasi-metric):
 
 $$d_{\text{geo}}(h_A \to h_B) = \int_0^1 \sqrt{m\lVert\dot h_{\ell(t)}\rVert} \lVert\dot\gamma(t)\rVert \mathrm{d}t$$
 
@@ -64,7 +82,7 @@ Because the damped geodesic equation includes a friction term $-\gamma \dot h^k$
 
 $$d_{\text{geo}}(h_A \to h_B) \neq d_{\text{geo}}(h_B \to h_A)$$
 
-The Diagnostic Battery (Arm 5) measures asymmetry ratios of 1.35–1.40 across all three SPLM-family models. This is a structural consequence of the damped dynamics: paths "with the flow" (toward broader attractor basins) are shorter than paths against it.
+The Diagnostic Battery (Arm 5) measures asymmetry ratios of 1.35–1.40 across all three **SPLM-family** (conservative) models. This is a structural consequence of the damped dynamics: paths "with the flow" (toward broader attractor basins) are shorter than paths against it. No such ratio has been measured on a Fock model, and the reverse channel, which dominates the Fock step, is not part of this construction.
 
 ### 2.4 Basin membership via anisotropic Gaussian wells
 
@@ -80,7 +98,7 @@ $$k^{\ast}(h) = \arg\min_k \bigl[ d_{\text{Maha},k}^2(h) - 2\log w_k \bigr]$$
 
 <p align="center"><img src="images/scaf_basin_crossing_conformal_landscape.png" alt="A topographic map of a two-well potential landscape showing a factual hidden state and two counterfactual displacements: a small within-basin move (low cosine deviation, no well reassignment) versus a large basin-crossing move into the neighboring well (high cosine deviation and well reassignment). An inset shows that the cosine angle between two directions is the same whether measured deep in a well or near the ridge, while their Euclidean length is not." width="700"></p>
 
-*Figure 1. Basin-crossing leaks vs. continuous perturbation. A future-token perturbation that keeps the past hidden state within its original attractor (top arrow) is a mild, within-basin deviation — nonzero cosine deviation but no change in dominant well. A perturbation that pushes the hidden state across the ridge into a different attractor (bottom arrow) is a basin-crossing leak — a qualitatively more severe corruption that logit-space metrics cannot distinguish from the mild case. The inset illustrates why cosine similarity, unlike raw Euclidean distance, gives the same reading regardless of the local depth of the potential (the conformal factor Omega), which is what makes it the geometrically correct choice for Tier A.*
+*Figure 1. Basin-crossing leaks vs. continuous perturbation. A future-token perturbation that keeps the past hidden state within its original attractor (top arrow) is a mild, within-basin deviation — nonzero cosine deviation but no change in dominant well. A perturbation that pushes the hidden state across the ridge into a different attractor (bottom arrow) is a basin-crossing leak — a qualitatively more severe corruption that logit-space metrics cannot distinguish from the mild case. The inset illustrates that the angle between two directions at one point does not depend on the local depth of the potential (the conformal factor Omega), while their lengths do. Tier A compares two positions rather than two directions at one point; its justification is the LayerNorm sphere (§3).*
 
 ---
 
@@ -96,7 +114,10 @@ $$\Delta_{\cos}^{(\ell)}(t) = 1 - \cos\bigl(h_\ell^{(t)}[\text{factual}], h_\ell
 
 for each layer $\ell$ and causal-prefix position $t \le t_p$.
 
-**Why cosine, not L2:** conformal invariance (§2.2). The cosine deviation is the same quantity whether computed in flat $\mathbb{R}^d$ or in the curved Jacobi metric. L2 deviation would conflate the leak magnitude with the local potential energy.
+**Why cosine:** with `ln_after_step`, every layer's output is projected onto the LayerNorm sphere (radius about $\sqrt d$), so position on that sphere is carried by direction, and the angle between $h_{\text{factual}}$ and $h_{\text{counterfactual}}$ is the natural comparison.
+- It is also exact for detection. Under strict causality the two states are bit-identical, so $\Delta_{\cos} = 0$ exactly, and any nonzero value is a leak.
+- L2 would serve as a detector as well.
+- The earlier argument from conformal invariance (§2.2) does not apply here, because it concerns tangent vectors at one point, not two positions.
 
 **Why it matters beyond logit L∞:** a hidden-state leak that hasn't yet propagated to logits (e.g., register states carrying future information that the output projection kills, or a leak in an intermediate layer that a subsequent LayerNorm washes out of the magnitude but preserves directionally) would show $\Delta_{\cos}^{(\ell)} > 0$ even when logit L∞ $= 0$.
 
@@ -121,15 +142,17 @@ $$\beta^{(\ell)}(t) = \mathbb{1}\bigl[k^{\ast}_\ell(h^{(t)}_\ell[\text{factual}]
 
 where $k^{\ast}_\ell(h)$ is the dominant well index at layer $\ell$ (§2.4).
 
-**Why it matters:** a basin-crossing leak is qualitatively more severe than a continuous perturbation. It means the future perturbation has moved the hidden state to a **different semantic attractor** — the model is computing a fundamentally different representation of the past, not just a slightly perturbed one. This is invisible to logit L∞ (which measures magnitude, not attractor structure) and to cosine similarity (which would show $\Delta_{\cos} > 0$ for both, without distinguishing the two cases).
+**Why it matters:** a basin-crossing leak is qualitatively more severe than a continuous perturbation. It means the future perturbation has moved the past hidden state into the region of a **different well of $V_\theta$**. In conservative models that well is an attractor of the dynamics. In the Fock models the register push dominates the step, so the dominant-well index is a **descriptive label** of where the state sits in the $V_\theta$ landscape, not an attractor it relaxes into. This is invisible to logit L∞ (which measures magnitude, not attractor structure) and to cosine similarity (which would show $\Delta_{\cos} > 0$ for both, without distinguishing the two cases).
 
 **Aggregation:** the **basin-crossing rate** $\bar\beta = \mathbb{E}[\beta^{(\ell)}(t)]$ over positions and layers gives a single scalar measuring what fraction of past hidden states are knocked into a different well by the future perturbation. This is reported alongside AILE as a separate effect-size axis.
 
 **Applicability:** requires Gaussian $V_\theta$ with accessible well parameters (centres $\mu_k$, precision $\Sigma_k^{-1}$, weights $w_k$). For MLP $V_\theta$ models, an approximate version can be obtained by clustering hidden states into pseudo-basins via k-means on the $V_\theta$ gradient field.
 
-### Tier C: Asymmetric geodesic leak distance
+### Tier C: Asymmetric damped-path leak measure (conservative models only; not implemented)
 
-**What it measures:** the damped-geodesic distance from the factual hidden state to the counterfactual one, and vice versa.
+**Status.** This tier is a design and is not implemented; SCAF has no `GeodesicLeakProbe`. It is defined only for conservative models (no reverse channel). On those models the damped geodesics of $V_\theta$ describe the dynamics at the trained step size. On Fock models they do not.
+
+**What it measures:** the length of the damped path from the factual hidden state to the counterfactual one, and back. As §2.3 notes, this is a direction-dependent action cost, not a Riemannian distance.
 
 **Metrics:**
 
@@ -141,12 +164,12 @@ $$r^{(\ell)}(t) = d_{\to}^{(\ell)}(t) / d_{\leftarrow}^{(\ell)}(t)$$
 
 **Computation:** requires shooting-method integration of the damped geodesic equation between the two hidden states, using the model's own $V_\theta$ for Christoffel symbols (closed-form for Gaussian $V_\theta$ via `analytical_grad`). This is expensive — $O(d \cdot n_{\text{steps}})$ per pair — and is intended for Tier-2 re-analysis of already-detected leaks, not for real-time monitoring.
 
-**Interpretation of the asymmetry ratio:**
+**Interpretation of the asymmetry ratio: a hypothesis to calibrate, not a decision rule.** The reading below has never been tested. Before it is used, $r$ must be measured on leaks of known mechanism: a deliberately injected wiring leak, and the known Fock reverse-channel leak together with its `prefix_causal_registers` fix. For Fock models in particular, there is no reason a leak carried by the reverse channel, which lies outside the metric, should reproduce the conservative dynamics' 1.35–1.40 asymmetry.
 
 | $r$ value | Interpretation |
 |---|---|
 | $r \approx 1.0$ | The leak bypasses the dynamics entirely — a **wiring-level** short circuit (e.g., direct attention to future tokens through a masking bug). The factual↔counterfactual path is equally easy in both directions because it doesn't go through the potential landscape. |
-| $r \approx 1.35$–$1.40$ | The leak propagates **through the model's normal dynamical pathway** (e.g., reverse channel). The asymmetry matches the architecture's measured Frobenius asymmetry ratio (Diagnostic Battery Arm 5), indicating the leaked information travels along the same force-field trajectories as legitimate semantic content. |
+| $r \approx 1.35$–$1.40$ | Hypothesis: the leak propagates through the **conservative** dynamics. The asymmetry would match the SPLM-family ratio (Diagnostic Battery Arm 5). This does not extend to the Fock reverse channel, which is not part of the metric. |
 | $r \gg 1.4$ or $r \ll 1.0$ | Anomalous — the leak follows a pathway with abnormal directional preference. This would indicate a new, previously uncharacterised leak mechanism distinct from both wiring bugs and reverse-channel leaks. |
 
 <p align="center"><img src="images/scaf_asymmetric_geodesic_leak_pathway.png" alt="A potential energy bowl showing a short, direct forward geodesic path from the factual to the counterfactual hidden state going downhill with the damping, versus a long, winding backward path going uphill against the damping. Below, a gauge bar maps the asymmetry ratio r to three diagnoses: wiring bypass near r equals 1.0, dynamical pathway near r equals 1.35 to 1.40, and anomalous outside that range." width="700"></p>
@@ -217,7 +240,7 @@ Reports:
 - `per_layer_crossing_rate`: list of per-layer $\bar\beta^{(\ell)}$
 - `worst_layer`: the layer with highest crossing rate (likely the reverse-channel injection point)
 
-#### `GeodesicLeakProbe` (Tier C)
+#### `GeodesicLeakProbe` (Tier C; not implemented, conservative models only)
 
 Requires `has_vtheta_wells` capability (for analytical Christoffel symbols). Only runs on the top-K most deviant (layer, position) pairs identified by `HiddenStateLeakProbe` (the shooting-method integration is too expensive for all pairs).
 
@@ -225,7 +248,7 @@ Reports:
 
 - `mean_d_forward`, `mean_d_backward`: average geodesic distance in each direction
 - `asymmetry_ratio`: $\bar r = \overline{d_\to / d_\leftarrow}$
-- `leak_pathway`: `"wiring"` if $\bar r \approx 1.0$, `"dynamical"` if $\bar r \approx 1.35$–$1.40$, `"anomalous"` otherwise
+- `leak_pathway`: **not to be reported** until the ratio is calibrated on leaks of known mechanism (Tier C). Until then the probe reports the ratio without a label.
 
 ### 4.3 New LeakFrame columns
 
@@ -257,17 +280,16 @@ These columns enable new causal heterogeneity analyses via `estimate_leak(cate_a
 The three tiers form a **refinement hierarchy**:
 
 ```
-Tier A (cosine)    ⊇    Tier B (basin)    ⊇    Tier C (geodesic)
-    cheap,                moderate,               expensive,
-    conformally           V_theta-aware,           full Riemannian,
-    correct,              discrete leak            asymmetric,
-    catches all           characterisation         pathway
-    hidden-state                                   diagnosis
-    leaks
+Tier A (cosine)        ⊇    Tier B (basin)       ⊇    Tier C (damped path)
+    cheap,                     moderate,                 expensive,
+    LN-sphere angle,           V_theta-aware,            asymmetric action,
+    exact detector,            discrete leak             conservative models only,
+    catches all                characterisation          uncalibrated,
+    hidden-state leaks                                   not implemented
 ```
 
 - Every basin-crossing leak ($\beta = 1$) also produces a cosine deviation ($\Delta_{\cos} > 0$), but not vice versa — a small within-basin perturbation has $\Delta_{\cos} > 0$ but $\beta = 0$.
-- The geodesic distance refines both by providing a metric that respects the model's potential landscape and reveals the directional structure of the leak.
+- On conservative models, the damped-path measure would refine both by sizing the leak in the $V_\theta$ geometry and showing its direction. That is a hypothesis until it is calibrated (Tier C), and it does not apply to Fock models.
 
 **Recommended deployment:** Tier A in `LeakMonitor` (cheap enough for every eval step); Tier B in `audit()` for Gaussian $V_\theta$ models (moderate cost, high diagnostic value); Tier C as a post-hoc analysis tool for characterising detected leaks (expensive, not real-time).
 
@@ -313,7 +335,7 @@ The existing logit-level metrics remain the **primary audit gate** — they're m
 1. Implement shooting-method geodesic integration using `analytical_grad` from the Gaussian $V_\theta$ classes
 2. Add `GeodesicLeakProbe` with adaptive step control (the integration must handle the full-rank conformal factor, not just the Euclidean straight line)
 3. Compute asymmetry ratios on the known Fock leak and on the `prefix_causal_registers=True` fixed model
-4. Compare the measured leak asymmetry ratio to the architecture's Frobenius asymmetry ratio (Arm 5 of the Diagnostic Battery) — if they match, the leak travels through the normal dynamical pathway
+4. Calibrate first. Measure the ratio on leaks of known mechanism (an injected wiring leak, and a conservative-path leak) before attaching any pathway label. Restrict use to conservative models, since in Fock models the dominant (reverse-channel) part of the step is not in the metric.
 
 ### Phase 4: Native retrieval diagnostic (future)
 
